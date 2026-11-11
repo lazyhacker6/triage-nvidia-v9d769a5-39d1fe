@@ -1,0 +1,2580 @@
+/* clang-format off */
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/* clang-format on */
+
+#include <dual_simplex/presolve.hpp>
+
+#include <dual_simplex/bounds_strengthening.hpp>
+#include <dual_simplex/folding.hpp>
+#include <dual_simplex/right_looking_lu.hpp>
+#include <dual_simplex/solve.hpp>
+#include <math_optimization/tic_toc.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cuopt/logger_macros.hpp>
+#include <iostream>
+#include <limits>
+
+namespace cuopt::mathematical_optimization::simplex {
+
+template <typename i_t, typename f_t>
+/** Number of leading linear columns; SOCP cone variables occupy [linear_cols, num_cols). */
+static i_t linear_variable_count(const lp_problem_t<i_t, f_t>& problem)
+{
+  return problem.second_order_cone_dims.empty() ? problem.num_cols : problem.cone_var_start;
+}
+
+template <typename f_t>
+static f_t quadratic_1d_obj(f_t x, f_t c, f_t q)
+{
+  return c * x + 0.5 * q * x * x;
+}
+
+// Minimizer of c*x + (1/2) q x^2 over [lower, upper]. False if unbounded.
+template <typename f_t>
+static bool unconstrained_1d_qp_minimizer(f_t c, f_t q, f_t lower, f_t upper, f_t& x)
+{
+  if (q > 0) {
+    x = std::min(upper, std::max(lower, -c / q));
+    return std::isfinite(x);
+  }
+  if (q < 0) {
+    if (lower <= -inf || upper >= inf) { return false; }
+    x = (quadratic_1d_obj(lower, c, q) <= quadratic_1d_obj(upper, c, q)) ? lower : upper;
+    return true;
+  }
+  if (c >= 0 && lower > -inf) {
+    x = lower;
+    return true;
+  }
+  if (c <= 0 && upper < inf) {
+    x = upper;
+    return true;
+  }
+  return false;
+}
+
+template <typename i_t, typename f_t>
+static void collect_diagonal_quadratic(const csr_matrix_t<i_t, f_t>& Q,
+                                       std::vector<f_t>& q_diag,
+                                       std::vector<bool>& q_coupled)
+{
+  const i_t n = static_cast<i_t>(q_diag.size());
+  for (i_t i = 0; i < Q.m; ++i) {
+    for (i_t p = Q.row_start[i]; p < Q.row_start[i + 1]; ++p) {
+      const i_t col = Q.j[p];
+      if (i == col) {
+        q_diag[i] += Q.x[p];
+      } else {
+        q_coupled[i] = true;
+        if (col >= 0 && col < n) { q_coupled[col] = true; }
+      }
+    }
+  }
+}
+
+// Drop marked variables from square Q (rows and matching column indices).
+template <typename i_t, typename f_t>
+static void remove_variables_from_Q(csr_matrix_t<i_t, f_t>& Q,
+                                    std::vector<i_t>& col_marker,
+                                    const std::vector<i_t>& col_old_to_new,
+                                    i_t new_cols)
+{
+  csr_matrix_t<i_t, f_t> Qout(0, 0, 0);
+  Q.remove_rows(col_marker, Qout);
+  const i_t nnz = Qout.row_start[Qout.m];
+  for (i_t p = 0; p < nnz; ++p) {
+    const i_t new_col = col_old_to_new[Qout.j[p]];
+    assert(new_col != -1);
+    Qout.j[p] = new_col;
+  }
+  Qout.n      = new_cols;
+  Qout.nz_max = nnz;
+  Q           = std::move(Qout);
+}
+
+// Sparse matrix used while substituting free variables.
+//
+// Rows and columns live in two flat arenas (row-major and column-major, each with a little
+// slack per line) rather than a hash map per row and a vector per column. Random access
+// into a row goes through scatter, which indexes one row at a time; substitution keeps
+// updating the same target row, so that row stays resident and each update costs
+// O(pivot nonzeros). Re-scattering per elimination is quadratic when one row is dense.
+template <typename i_t, typename f_t>
+struct substitution_matrix_t {
+  // Rows at or below this length are searched directly, so glancing at a short row does not
+  // evict a long resident one.
+  static constexpr i_t scan_limit = 16;
+
+  i_t num_rows = 0;
+  i_t num_cols = 0;
+  std::vector<i_t> row_col;
+  std::vector<f_t> row_val;
+  std::vector<i_t> row_start;
+  std::vector<i_t> row_len;
+  std::vector<i_t> row_cap;
+  // Row indices per column, append only: an entry whose row no longer holds the column is
+  // dropped when that column is scanned.
+  std::vector<i_t> col_row;
+  std::vector<i_t> col_start;
+  std::vector<i_t> col_len;
+  std::vector<i_t> col_cap;
+  std::vector<i_t> scatter;  // column -> offset within the resident row, -1 when absent
+  std::vector<f_t> row_max;  // inf-norm of each row, kept up to date on insert/erase/set
+  i_t scattered = -1;
+  // Arena high-water marks. A line that outgrows its slot is relocated to the tail with
+  // twice the capacity, so appends are amortized O(1); the holes left behind are reclaimed
+  // by a compaction once they outweigh the live entries.
+  i_t row_used = 0;
+  i_t col_used = 0;
+
+  static i_t slack(i_t len) { return std::max<i_t>(4, len / 8); }
+
+  void build(const lp_problem_t<i_t, f_t>& problem)
+  {
+    num_rows      = problem.num_rows;
+    num_cols      = problem.num_cols;
+    const i_t nnz = problem.A.col_start[num_cols];
+
+    // Counting pass over the CSC input gives the row lengths, then a prefix sum lays out
+    // the row arena and a single scatter fills it.
+    row_len.assign(num_rows, 0);
+    for (i_t p = 0; p < nnz; ++p) {
+      ++row_len[problem.A.i[p]];
+    }
+    row_start.resize(num_rows);
+    row_cap.resize(num_rows);
+    i_t used = 0;
+    for (i_t i = 0; i < num_rows; ++i) {
+      row_start[i] = used;
+      row_cap[i]   = row_len[i] + slack(row_len[i]);
+      used += row_cap[i];
+    }
+    row_used = used;
+    row_col.assign(used, 0);
+    row_val.assign(used, 0);
+    std::vector<i_t> cursor(row_start);
+    for (i_t j = 0; j < num_cols; ++j) {
+      for (i_t p = problem.A.col_start[j]; p < problem.A.col_start[j + 1]; ++p) {
+        const i_t q = cursor[problem.A.i[p]]++;
+        row_col[q]  = j;
+        row_val[q]  = problem.A.x[p];
+      }
+    }
+
+    col_start.resize(num_cols);
+    col_len.resize(num_cols);
+    col_cap.resize(num_cols);
+    used = 0;
+    for (i_t j = 0; j < num_cols; ++j) {
+      col_len[j]   = problem.A.col_start[j + 1] - problem.A.col_start[j];
+      col_start[j] = used;
+      col_cap[j]   = col_len[j] + slack(col_len[j]);
+      used += col_cap[j];
+    }
+    col_used = used;
+    col_row.assign(used, 0);
+    for (i_t j = 0; j < num_cols; ++j) {
+      i_t q = col_start[j];
+      for (i_t p = problem.A.col_start[j]; p < problem.A.col_start[j + 1]; ++p, ++q) {
+        col_row[q] = problem.A.i[p];
+      }
+    }
+
+    scatter.assign(num_cols, -1);
+    row_max.assign(num_rows, 0);
+    for (i_t i = 0; i < num_rows; ++i) {
+      recompute_row_max(i);
+    }
+  }
+
+  i_t column(i_t i, i_t offset) const { return row_col[row_start[i] + offset]; }
+  f_t value(i_t i, i_t offset) const { return row_val[row_start[i] + offset]; }
+
+  void recompute_row_max(i_t i)
+  {
+    f_t max_abs = 0;
+
+    const i_t start = row_start[i];
+    for (i_t k = 0; k < row_len[i]; ++k) {
+      max_abs = std::max(max_abs, std::abs(row_val[start + k]));
+    }
+    row_max[i] = max_abs;
+  }
+
+  void set_value(i_t i, i_t offset, f_t value)
+  {
+    f_t& slot         = row_val[row_start[i] + offset];
+    const f_t old_abs = std::abs(slot);
+    slot              = value;
+    const f_t new_abs = std::abs(value);
+    if (new_abs >= row_max[i]) {
+      row_max[i] = new_abs;
+    } else if (old_abs == row_max[i]) {
+      recompute_row_max(i);
+    }
+  }
+
+  void unload()
+  {
+    if (scattered == -1) { return; }
+    const i_t start = row_start[scattered];
+    for (i_t k = 0; k < row_len[scattered]; ++k) {
+      scatter[row_col[start + k]] = -1;
+    }
+    scattered = -1;
+  }
+
+  void load(i_t i)
+  {
+    if (scattered == i) { return; }
+    unload();
+    const i_t start = row_start[i];
+    for (i_t k = 0; k < row_len[i]; ++k) {
+      scatter[row_col[start + k]] = k;
+    }
+    scattered = i;
+  }
+
+  i_t scan(i_t i, i_t col) const
+  {
+    const i_t start = row_start[i];
+    for (i_t k = 0; k < row_len[i]; ++k) {
+      if (row_col[start + k] == col) { return k; }
+    }
+    return -1;
+  }
+
+  // Offset of (i, col) within row i, or -1 when absent.
+  i_t find(i_t i, i_t col)
+  {
+    if (scattered == i) { return scatter[col]; }
+    if (row_len[i] <= scan_limit) { return scan(i, col); }
+    load(i);
+    return scatter[col];
+  }
+
+  // erase and insert both require row i to be resident.
+  void erase(i_t i, i_t offset)
+  {
+    const i_t start                  = row_start[i];
+    const i_t last                   = row_len[i] - 1;
+    const f_t old_abs                = std::abs(row_val[start + offset]);
+    scatter[row_col[start + offset]] = -1;
+    if (offset != last) {
+      row_col[start + offset]          = row_col[start + last];
+      row_val[start + offset]          = row_val[start + last];
+      scatter[row_col[start + offset]] = offset;
+    }
+    row_len[i] = last;
+    if (old_abs == row_max[i]) { recompute_row_max(i); }
+  }
+
+  void insert(i_t i, i_t col, f_t value)
+  {
+    reserve_row(i);
+    const i_t offset               = row_len[i];
+    row_col[row_start[i] + offset] = col;
+    row_val[row_start[i] + offset] = value;
+    scatter[col]                   = offset;
+    row_len[i]                     = offset + 1;
+    row_max[i]                     = std::max(row_max[i], std::abs(value));
+    reserve_col(col);
+    col_row[col_start[col] + col_len[col]] = i;
+    ++col_len[col];
+  }
+
+  // Relocation and compaction both preserve the order within a line, so resident offsets
+  // stay valid across either.
+  void reserve_row(i_t i)
+  {
+    if (row_len[i] < row_cap[i]) { return; }
+    const i_t need = std::max<i_t>(row_len[i] + 1, 2 * row_cap[i]);
+    if (row_used + need > static_cast<i_t>(row_col.size())) {
+      i_t live = 0;
+      for (i_t r = 0; r < num_rows; ++r) {
+        live += row_len[r];
+      }
+      if (row_used > 2 * (live + num_rows)) { compact_rows(); }
+      if (row_used + need > static_cast<i_t>(row_col.size())) {
+        const i_t size = std::max<i_t>(row_used + need, 2 * static_cast<i_t>(row_col.size()) + 1);
+        row_col.resize(size, 0);
+        row_val.resize(size, 0);
+      }
+      if (row_len[i] < row_cap[i]) { return; }
+    }
+    std::copy_n(row_col.begin() + row_start[i], row_len[i], row_col.begin() + row_used);
+    std::copy_n(row_val.begin() + row_start[i], row_len[i], row_val.begin() + row_used);
+    row_start[i] = row_used;
+    row_cap[i]   = need;
+    row_used += need;
+  }
+
+  void reserve_col(i_t j)
+  {
+    if (col_len[j] < col_cap[j]) { return; }
+    const i_t need = std::max<i_t>(col_len[j] + 1, 2 * col_cap[j]);
+    if (col_used + need > static_cast<i_t>(col_row.size())) {
+      i_t live = 0;
+      for (i_t c = 0; c < num_cols; ++c) {
+        live += col_len[c];
+      }
+      if (col_used > 2 * (live + num_cols)) { compact_cols(); }
+      if (col_used + need > static_cast<i_t>(col_row.size())) {
+        const i_t size = std::max<i_t>(col_used + need, 2 * static_cast<i_t>(col_row.size()) + 1);
+        col_row.resize(size, 0);
+      }
+      if (col_len[j] < col_cap[j]) { return; }
+    }
+    std::copy_n(col_row.begin() + col_start[j], col_len[j], col_row.begin() + col_used);
+    col_start[j] = col_used;
+    col_cap[j]   = need;
+    col_used += need;
+  }
+
+  void compact_rows()
+  {
+    std::vector<i_t> new_start(num_rows);
+    i_t used = 0;
+    for (i_t i = 0; i < num_rows; ++i) {
+      new_start[i] = used;
+      used += row_len[i] + slack(row_len[i]);
+    }
+    std::vector<i_t> new_col(std::max<i_t>(used, 1), 0);
+    std::vector<f_t> new_val(std::max<i_t>(used, 1), 0);
+    for (i_t i = 0; i < num_rows; ++i) {
+      std::copy_n(row_col.begin() + row_start[i], row_len[i], new_col.begin() + new_start[i]);
+      std::copy_n(row_val.begin() + row_start[i], row_len[i], new_val.begin() + new_start[i]);
+      row_cap[i] = row_len[i] + slack(row_len[i]);
+    }
+    row_col   = std::move(new_col);
+    row_val   = std::move(new_val);
+    row_start = std::move(new_start);
+    row_used  = used;
+  }
+
+  void compact_cols()
+  {
+    std::vector<i_t> new_start(num_cols);
+    i_t used = 0;
+    for (i_t j = 0; j < num_cols; ++j) {
+      new_start[j] = used;
+      used += col_len[j] + slack(col_len[j]);
+    }
+    std::vector<i_t> new_row(std::max<i_t>(used, 1), 0);
+    for (i_t j = 0; j < num_cols; ++j) {
+      std::copy_n(col_row.begin() + col_start[j], col_len[j], new_row.begin() + new_start[j]);
+      col_cap[j] = col_len[j] + slack(col_len[j]);
+    }
+    col_row   = std::move(new_row);
+    col_start = std::move(new_start);
+    col_used  = used;
+  }
+};
+
+// Eliminate zero-cost, Q-uncoupled free linear variables by sparse equality substitution.
+// This is especially useful for conic formulations containing chains of auxiliary free
+// variables: unlike regularizing those variables in the KKT system, substitution is exact.
+// Returns the number of columns left alone because no incident row passed the pivot threshold.
+template <typename i_t, typename f_t>
+static i_t eliminate_free_variables(lp_problem_t<i_t, f_t>& problem,
+                                    presolve_info_t<i_t, f_t>& presolve_info)
+{
+  const i_t old_m       = problem.num_rows;
+  const i_t old_n       = problem.num_cols;
+  const i_t linear_cols = linear_variable_count(problem);
+  if (old_m == 0 || linear_cols == 0) { return 0; }
+
+  std::vector<char> q_present(old_n, 0);
+  if (problem.Q.n > 0) {
+    // Q is square and symmetric, so a nonempty row is exactly the Q-coupled variables.
+    const i_t q_n = std::min(problem.Q.m, old_n);
+    for (i_t row = 0; row < q_n; ++row) {
+      if (problem.Q.row_start[row + 1] > problem.Q.row_start[row]) { q_present[row] = 1; }
+    }
+  }
+
+  substitution_matrix_t<i_t, f_t> matrix;
+  matrix.build(problem);
+
+  std::vector<char> active_row(old_m, 1);
+  std::vector<char> active_col(old_n, 1);
+  auto& eliminations = presolve_info.free_variable_eliminations;
+
+  // A column list is append-only: fill re-adds a row that may already be listed, and
+  // eliminated rows are never unlisted. Compact it during the scan so the pass stays linear.
+  std::vector<i_t> row_stamp(old_m, -1);
+  i_t stamp = 0;
+  std::vector<i_t> incident;
+  std::vector<f_t> incident_value;
+
+  // The pivot must be the largest entry of both its row and its column, so the
+  // substitution cannot amplify a coefficient.
+  constexpr f_t row_pivot_tol = 1.0;
+  constexpr f_t col_pivot_tol = 1.0;
+  i_t pivot_rejected          = 0;
+
+  // One pass in column order. Peeling a chain from one end keeps each pivot row sparse, so
+  // revisiting columns buys almost nothing and costs a requeue storm on models with
+  // hundreds of thousands of free columns.
+  for (i_t j = 0; j < linear_cols; ++j) {
+    if (!active_col[j] || problem.lower[j] != -inf || problem.upper[j] != inf ||
+        problem.objective[j] != 0 || q_present[j]) {
+      continue;
+    }
+
+    incident.clear();
+    incident_value.clear();
+    const i_t listed = matrix.col_start[j];
+    i_t keep         = 0;
+    ++stamp;
+    for (i_t idx = 0; idx < matrix.col_len[j]; ++idx) {
+      const i_t i = matrix.col_row[listed + idx];
+      if (row_stamp[i] == stamp) { continue; }
+      row_stamp[i] = stamp;
+      if (!active_row[i]) { continue; }
+      // Keep a_ij from this probe; pivot selection and the update reuse it.
+      const i_t offset = matrix.find(i, j);
+      if (offset == -1 || matrix.value(i, offset) == 0) { continue; }
+      matrix.col_row[listed + keep] = i;
+      ++keep;
+      incident.push_back(i);
+      incident_value.push_back(matrix.value(i, offset));
+    }
+    matrix.col_len[j] = keep;
+
+    free_variable_elimination_t<i_t, f_t> elimination;
+    elimination.variable = j;
+    if (incident.empty()) {
+      elimination.pivot_row         = -1;
+      elimination.pivot_coefficient = 1;
+      elimination.rhs               = 0;
+      eliminations.push_back(std::move(elimination));
+      active_col[j] = 0;
+      continue;
+    }
+
+    // Threshold pivoting, as in the LU: a pivot that is tiny relative to its own row or to the
+    // rest of its column makes the multiplier a_ij / a_pj huge and inflates every surviving row
+    // by that factor, which the barrier's KKT solve cannot recover from. The column test bounds
+    // the multiplier, the row test bounds the coefficients the pivot row scatters. At tolerance
+    // 1 the pivot is the largest entry of both its row and its column, so no coefficient grows.
+    // Among those, pick the shortest row so a chain peels from a sparse end.
+    f_t column_max = 0;
+    for (const f_t value : incident_value) {
+      column_max = std::max(column_max, std::abs(value));
+    }
+    i_t pivot_slot = -1;
+    i_t best_len   = std::numeric_limits<i_t>::max();
+    for (size_t slot = 0; slot < incident.size(); ++slot) {
+      const f_t a_ij = std::abs(incident_value[slot]);
+      if (a_ij < col_pivot_tol * column_max) { continue; }
+      const i_t row = incident[slot];
+      if (a_ij < row_pivot_tol * matrix.row_max[row]) { continue; }
+      const i_t len = matrix.row_len[row];
+      if (len < best_len) {
+        best_len   = len;
+        pivot_slot = static_cast<i_t>(slot);
+      }
+    }
+    // No stable pivot: leave the column as a free variable handled directly in the KKT system.
+    if (pivot_slot == -1) {
+      ++pivot_rejected;
+      continue;
+    }
+    const i_t pivot             = incident[pivot_slot];
+    const f_t pivot_coefficient = incident_value[pivot_slot];
+    const i_t pivot_len         = matrix.row_len[pivot];
+
+    // Snapshot the pivot row before touching the matrix: the arena can relocate rows when a
+    // substitution inserts, and postsolve needs these coefficients anyway.
+    elimination.columns.reserve(pivot_len - 1);
+    elimination.coefficients.reserve(pivot_len - 1);
+    for (i_t k = 0; k < pivot_len; ++k) {
+      const i_t col = matrix.column(pivot, k);
+      if (col == j) { continue; }
+      elimination.columns.push_back(col);
+      elimination.coefficients.push_back(matrix.value(pivot, k));
+    }
+
+    // Accept only if the substitution does not add nonzeros. Dropping the pivot row and the
+    // a_ij entries pays for the entries the pivot row scatters into the other incident rows.
+    // Integrator chains have a sparse pivot and degree 2, so they clear this easily; the
+    // dense equalities of a converted QCQP do not, and aggregating those is what densified A
+    // and stalled the barrier.
+    i_t added = 0;
+    for (const i_t i : incident) {
+      if (i == pivot) { continue; }
+      for (const i_t col : elimination.columns) {
+        if (matrix.find(i, col) == -1) { ++added; }
+      }
+    }
+    const i_t removed = pivot_len + static_cast<i_t>(incident.size()) - 1;
+    if (added > removed) { continue; }
+
+    elimination.pivot_row         = pivot;
+    elimination.pivot_coefficient = pivot_coefficient;
+    elimination.rhs               = problem.rhs[pivot];
+
+    for (const i_t i : incident) {
+      if (i == pivot) { continue; }
+      matrix.load(i);
+      const i_t j_offset = matrix.scatter[j];
+      if (j_offset == -1) { continue; }
+      const f_t factor = matrix.value(i, j_offset) / pivot_coefficient;
+      matrix.erase(i, j_offset);
+      for (size_t k = 0; k < elimination.columns.size(); ++k) {
+        const i_t col       = elimination.columns[k];
+        const f_t delta     = factor * elimination.coefficients[k];
+        const i_t offset    = matrix.scatter[col];
+        const f_t old_value = offset == -1 ? f_t{0} : matrix.value(i, offset);
+        const f_t new_value = old_value - delta;
+        const f_t drop_tol  = f_t{100} * std::numeric_limits<f_t>::epsilon() *
+                             std::max({f_t{1}, std::abs(old_value), std::abs(delta)});
+        if (std::abs(new_value) <= drop_tol) {
+          if (offset != -1) { matrix.erase(i, offset); }
+        } else if (offset == -1) {
+          matrix.insert(i, col, new_value);
+        } else {
+          matrix.set_value(i, offset, new_value);
+        }
+      }
+      problem.rhs[i] -= factor * elimination.rhs;
+      elimination.affected_rows.push_back(i);
+      elimination.factors.push_back(factor);
+    }
+
+    if (matrix.scattered == pivot) { matrix.unload(); }
+    active_row[pivot] = 0;
+    active_col[j]     = 0;
+    eliminations.push_back(std::move(elimination));
+  }
+
+  if (eliminations.empty()) { return pivot_rejected; }
+
+  presolve_info.free_elimination_num_variables   = old_n;
+  presolve_info.free_elimination_num_constraints = old_m;
+  auto& remaining_cols = presolve_info.free_elimination_remaining_variables;
+  auto& remaining_rows = presolve_info.free_elimination_remaining_constraints;
+  remaining_cols.clear();
+  remaining_rows.clear();
+
+  std::vector<i_t> old_to_new_col(old_n, -1);
+  for (i_t j = 0; j < old_n; ++j) {
+    if (!active_col[j]) { continue; }
+    old_to_new_col[j] = static_cast<i_t>(remaining_cols.size());
+    remaining_cols.push_back(j);
+  }
+  for (i_t i = 0; i < old_m; ++i) {
+    if (active_row[i]) { remaining_rows.push_back(i); }
+  }
+
+  i_t new_n = static_cast<i_t>(remaining_cols.size());
+  i_t new_m = static_cast<i_t>(remaining_rows.size());
+  matrix.unload();
+  i_t new_nnz = 0;
+  for (const i_t i : remaining_rows) {
+    for (i_t k = 0; k < matrix.row_len[i]; ++k) {
+      if (active_col[matrix.column(i, k)] && matrix.value(i, k) != 0) { ++new_nnz; }
+    }
+  }
+
+  csr_matrix_t<i_t, f_t> reduced_A(new_m, new_n, new_nnz);
+  std::vector<f_t> reduced_rhs(new_m);
+  i_t nz = 0;
+  for (i_t new_i = 0; new_i < new_m; ++new_i) {
+    const i_t old_i            = remaining_rows[new_i];
+    reduced_A.row_start[new_i] = nz;
+    // Column order within a row is irrelevant here: to_compressed_col below buckets the
+    // entries by column in linear time, so sorting each row would only add O(nnz log nnz).
+    for (i_t k = 0; k < matrix.row_len[old_i]; ++k) {
+      const i_t old_j = matrix.column(old_i, k);
+      const f_t value = matrix.value(old_i, k);
+      if (!active_col[old_j] || value == 0) { continue; }
+      reduced_A.j[nz] = old_to_new_col[old_j];
+      reduced_A.x[nz] = value;
+      ++nz;
+    }
+    reduced_rhs[new_i] = problem.rhs[old_i];
+  }
+  reduced_A.row_start[new_m] = nz;
+
+  std::vector<f_t> objective(new_n);
+  std::vector<f_t> lower(new_n);
+  std::vector<f_t> upper(new_n);
+  for (i_t new_j = 0; new_j < new_n; ++new_j) {
+    const i_t old_j  = remaining_cols[new_j];
+    objective[new_j] = problem.objective[old_j];
+    lower[new_j]     = problem.lower[old_j];
+    upper[new_j]     = problem.upper[old_j];
+  }
+
+  std::vector<i_t> col_marker(old_n, 0);
+  for (i_t j = 0; j < old_n; ++j) {
+    if (!active_col[j]) { col_marker[j] = 1; }
+  }
+  if (problem.Q.n > 0) { remove_variables_from_Q(problem.Q, col_marker, old_to_new_col, new_n); }
+
+  reduced_A.to_compressed_col(problem.A);
+  problem.rhs       = std::move(reduced_rhs);
+  problem.objective = std::move(objective);
+  problem.lower     = std::move(lower);
+  problem.upper     = std::move(upper);
+  problem.num_rows  = new_m;
+  problem.num_cols  = new_n;
+  // Cone columns are never eliminated, so the cone block stays trailing and its new start is
+  // just the remapped old one. Without cones cone_var_start is 0 and must be left alone.
+  if (!problem.second_order_cone_dims.empty()) {
+    const i_t new_cone_start = old_to_new_col[problem.cone_var_start];
+    assert(new_cone_start != -1);
+    problem.cone_var_start = new_cone_start;
+  }
+
+  presolve_info.direct_free_variables.clear();
+  const i_t new_linear_cols = linear_variable_count(problem);
+  for (i_t new_j = 0; new_j < new_linear_cols; ++new_j) {
+    if (problem.lower[new_j] == -inf && problem.upper[new_j] == inf) {
+      presolve_info.direct_free_variables.push_back(new_j);
+    }
+  }
+  return pivot_rejected;
+}
+
+template <typename i_t, typename f_t>
+i_t remove_empty_cols(lp_problem_t<i_t, f_t>& problem,
+                      i_t& num_empty_cols,
+                      presolve_info_t<i_t, f_t>& presolve_info,
+                      i_t& linear_cols)
+{
+  constexpr bool verbose = false;
+  if (verbose) { printf("Removing %d empty columns\n", num_empty_cols); }
+  // Empty A columns: fix x_j by minimizing c_j x_j + (1/2) q_jj x_j^2.
+  // Off-diagonal Q entries couple the variable, so it is left in place.
+  presolve_info.removed_variables.reserve(num_empty_cols);
+  presolve_info.removed_values.reserve(num_empty_cols);
+  presolve_info.removed_reduced_costs.reserve(num_empty_cols);
+
+  std::vector<f_t> q_diag(problem.num_cols, 0.0);
+  std::vector<bool> q_coupled(problem.num_cols, false);
+  if (problem.Q.n > 0) { collect_diagonal_quadratic(problem.Q, q_diag, q_coupled); }
+
+  std::vector<i_t> col_marker(problem.num_cols, 0);
+  i_t new_cols = problem.num_cols;
+  for (i_t j = 0; j < linear_cols; ++j) {
+    if (problem.A.col_length(j) != 0 || q_coupled[j]) { continue; }
+    f_t x_fix;
+    if (!unconstrained_1d_qp_minimizer(
+          problem.objective[j], q_diag[j], problem.lower[j], problem.upper[j], x_fix)) {
+      continue;
+    }
+    presolve_info.removed_values.push_back(x_fix);
+    // A e_j = 0 and Q diagonal, so stationarity gives z_j = c_j + q_jj * x_j
+    const f_t removed_z = problem.objective[j] + q_diag[j] * x_fix;
+    problem.obj_constant += quadratic_1d_obj(x_fix, problem.objective[j], q_diag[j]);
+    col_marker[j] = 1;
+    presolve_info.removed_variables.push_back(j);
+    presolve_info.removed_reduced_costs.push_back(removed_z);
+    new_cols--;
+  }
+  presolve_info.remaining_variables.reserve(new_cols);
+
+  problem.A.remove_columns(col_marker);
+  // Clean up objective, lower, upper, and col_names
+  assert(new_cols == problem.A.n);
+  std::vector<f_t> objective(new_cols);
+  std::vector<f_t> lower(new_cols, -INFINITY);
+  std::vector<f_t> upper(new_cols, INFINITY);
+
+  std::vector<i_t> col_old_to_new(problem.num_cols, -1);
+  i_t new_j = 0;
+  for (i_t j = 0; j < problem.num_cols; ++j) {
+    if (!col_marker[j]) {
+      objective[new_j] = problem.objective[j];
+      lower[new_j]     = problem.lower[j];
+      upper[new_j]     = problem.upper[j];
+      presolve_info.remaining_variables.push_back(j);
+      col_old_to_new[j] = new_j;
+      new_j++;
+    } else {
+      num_empty_cols--;
+    }
+  }
+  if (problem.Q.n > 0) {
+    remove_variables_from_Q(problem.Q, col_marker, col_old_to_new, new_cols);
+    problem.Q.check_matrix("After removing empty columns");
+  }
+
+  if (!problem.second_order_cone_dims.empty()) {
+    i_t new_cone_start = col_old_to_new[problem.cone_var_start];
+    assert(new_cone_start != -1);
+    problem.cone_var_start = new_cone_start;
+  }
+
+  problem.objective = objective;
+  problem.lower     = lower;
+  problem.upper     = upper;
+  problem.num_cols  = new_cols;
+  // Update linear_cols to reflect the new number of linear variables after removing empty columns
+  linear_cols = linear_variable_count(problem);
+  return 0;
+}
+
+template <typename i_t, typename f_t>
+i_t remove_rows(lp_problem_t<i_t, f_t>& problem,
+                const std::vector<char>& row_sense,
+                csr_matrix_t<i_t, f_t>& Arow,
+                std::vector<i_t>& row_marker,
+                bool error_on_nonzero_rhs)
+{
+  constexpr bool verbose = false;
+  if (verbose) { printf("Removing rows %d %ld\n", Arow.m, row_marker.size()); }
+  csr_matrix_t<i_t, f_t> Aout(0, 0, 0);
+  Arow.remove_rows(row_marker, Aout);
+  i_t new_rows = Aout.m;
+  if (verbose) { printf("Cleaning up rhs. New rows %d\n", new_rows); }
+  std::vector<char> new_row_sense(new_rows);
+  std::vector<f_t> new_rhs(new_rows);
+  i_t row_count = 0;
+  for (i_t i = 0; i < problem.num_rows; ++i) {
+    if (!row_marker[i]) {
+      new_row_sense[row_count] = row_sense[i];
+      new_rhs[row_count]       = problem.rhs[i];
+      row_count++;
+    } else {
+      if (error_on_nonzero_rhs && problem.rhs[i] != 0.0) {
+        if (verbose) {
+          printf(
+            "Error nonzero rhs %e for zero row %d sense %c\n", problem.rhs[i], i, row_sense[i]);
+        }
+        return i + 1;
+      }
+    }
+  }
+  problem.rhs = new_rhs;
+  Aout.to_compressed_col(problem.A);
+  assert(problem.A.m == new_rows);
+  problem.num_rows = problem.A.m;
+  // No need to clean up the Q matrix since we are not removing any columns
+  return 0;
+}
+
+template <typename i_t, typename f_t>
+i_t remove_empty_rows(lp_problem_t<i_t, f_t>& problem,
+                      std::vector<char>& row_sense,
+                      i_t& num_empty_rows,
+                      presolve_info_t<i_t, f_t>& presolve_info)
+{
+  constexpr bool verbose = false;
+  if (verbose) { printf("Problem has %d empty rows\n", num_empty_rows); }
+  csr_matrix_t<i_t, f_t> Arow(0, 0, 0);
+  problem.A.to_compressed_row(Arow);
+  std::vector<i_t> row_marker(problem.num_rows);
+  presolve_info.removed_constraints.reserve(num_empty_rows);
+  presolve_info.remaining_constraints.reserve(problem.num_rows - num_empty_rows);
+  for (i_t i = 0; i < problem.num_rows; ++i) {
+    if ((Arow.row_start[i + 1] - Arow.row_start[i]) == 0) {
+      row_marker[i] = 1;
+      presolve_info.removed_constraints.push_back(i);
+      if (verbose) {
+        printf("Empty row %d start %d end %d\n", i, Arow.row_start[i], Arow.row_start[i + 1]);
+      }
+    } else {
+      presolve_info.remaining_constraints.push_back(i);
+      row_marker[i] = 0;
+    }
+  }
+  const i_t retval = remove_rows(problem, row_sense, Arow, row_marker, true);
+  return retval;
+}
+
+template <typename i_t, typename f_t>
+i_t remove_fixed_variables(f_t fixed_tolerance,
+                           lp_problem_t<i_t, f_t>& problem,
+                           i_t& fixed_variables)
+{
+  constexpr bool verbose = false;
+  if (verbose) { printf("Removing %d fixed variables\n", fixed_variables); }
+  // We have a variable with l_j = x_j = u_j
+  // Constraints of the form
+  //
+  // sum_{k != j} a_ik * x_k + a_ij * x_j {=, <=} beta
+  // become
+  // sum_{k != j} a_ik * x_k {=, <=} beta - a_ij * l_j
+  //
+  // The cost function
+  // sum_{k != j} c_k * x_k + c_j * x_j
+  // becomes
+  // sum_{k != j} c_k * x_k + c_j l_j
+
+  std::vector<i_t> col_marker(problem.num_cols);
+  for (i_t j = 0; j < problem.num_cols; ++j) {
+    if (std::abs(problem.upper[j] - problem.lower[j]) < fixed_tolerance) {
+      col_marker[j] = 1;
+      for (i_t p = problem.A.col_start[j]; p < problem.A.col_start[j + 1]; ++p) {
+        const i_t i   = problem.A.i[p];
+        const f_t aij = problem.A.x[p];
+        problem.rhs[i] -= aij * problem.lower[j];
+      }
+      problem.obj_constant += problem.objective[j] * problem.lower[j];
+    } else {
+      col_marker[j] = 0;
+    }
+  }
+
+  problem.A.remove_columns(col_marker);
+
+  // Clean up objective, lower, upper, and col_names
+  i_t new_cols = problem.A.n;
+  if (verbose) { printf("new cols %d\n", new_cols); }
+  std::vector<f_t> objective(new_cols);
+  std::vector<f_t> lower(new_cols);
+  std::vector<f_t> upper(new_cols);
+  i_t new_j = 0;
+  for (i_t j = 0; j < problem.num_cols; ++j) {
+    if (!col_marker[j]) {
+      objective[new_j] = problem.objective[j];
+      lower[new_j]     = problem.lower[j];
+      upper[new_j]     = problem.upper[j];
+      new_j++;
+      fixed_variables--;
+    }
+  }
+  problem.objective = objective;
+  problem.lower     = lower;
+  problem.upper     = upper;
+  problem.num_cols  = problem.A.n;
+  if (verbose) { printf("Finishing fixed columns\n"); }
+  return 0;
+}
+
+// Adds one slack column s_k per entry of `rows`; slack k has a single nonzero in row i = rows[k]:
+//   "<=" row (is_range = false):  a_i^T x + s_k = rhs_i,  s_k >= 0
+//   range row (is_range = true):  a_i^T x - s_k = 0,      lower[k] <= s_k <= upper[k]
+// - rows:        indices of the constraint rows of A that receive a slack.
+// - is_range:    selects the form above; the slack's entry in A is +1 or -1 respectively.
+// - lower/upper: bounds of each new slack, indexed like rows.
+// - new_slacks:  receives the column index of each new slack.
+// The slacks are inserted after the linear variables and before the cone variables, giving the
+// layout [linear | slacks | cone]; slacks have zero objective cost and empty rows/columns in Q.
+template <typename i_t, typename f_t>
+static void insert_slack_columns(lp_problem_t<i_t, f_t>& problem,
+                                 const std::vector<i_t>& rows,
+                                 bool is_range,
+                                 const std::vector<f_t>& lower,
+                                 const std::vector<f_t>& upper,
+                                 std::vector<i_t>& new_slacks)
+{
+  const i_t num_new = static_cast<i_t>(rows.size());
+  if (num_new == 0) { return; }
+  const i_t old_num_cols = problem.num_cols;
+  const i_t insert_at    = linear_variable_count(problem);
+  const i_t num_cols     = old_num_cols + num_new;
+
+  csc_matrix_t<i_t, f_t>& A = problem.A;
+  const i_t nz_before       = A.col_start[insert_at];
+  // Insert the pre-slack columns into the matrix A
+  A.i.insert(A.i.begin() + nz_before, rows.begin(), rows.end());
+  A.x.insert(A.x.begin() + nz_before, num_new, is_range ? f_t(-1) : f_t(1));
+  A.col_start.insert(A.col_start.begin() + insert_at, num_new, 0);
+  for (i_t k = 0; k < num_new; ++k) {
+    A.col_start[insert_at + k] = nz_before + k;
+    new_slacks.push_back(insert_at + k);
+  }
+  for (i_t j = insert_at + num_new; j <= num_cols; ++j) {
+    A.col_start[j] += num_new;
+  }
+  A.n = num_cols;
+  A.nz_max += num_new;
+  // Insert the slack columns into the objective, lower, and upper bound vectors
+  problem.objective.insert(problem.objective.begin() + insert_at, num_new, f_t(0));
+  problem.lower.insert(problem.lower.begin() + insert_at, lower.begin(), lower.end());
+  problem.upper.insert(problem.upper.begin() + insert_at, upper.begin(), upper.end());
+
+  if (problem.Q.n > 0) {
+    // Slacks have empty Q rows and columns: add the empty rows, then shift the column indices
+    // that point past them.
+    csr_matrix_t<i_t, f_t>& Q = problem.Q;
+    const i_t q_start         = Q.row_start[insert_at];
+    Q.row_start.insert(Q.row_start.begin() + insert_at + 1, num_new, q_start);
+    for (i_t& col : Q.j) {
+      if (col >= insert_at) { col += num_new; }
+    }
+    Q.m = num_cols;
+    Q.n = num_cols;
+  }
+
+  problem.num_cols = num_cols;
+  // Update the cone variable start index for second-order cone constraints
+  if (!problem.second_order_cone_dims.empty()) { problem.cone_var_start += num_new; }
+}
+
+template <typename i_t, typename f_t>
+i_t convert_less_than_to_equal(const user_problem_t<i_t, f_t>& user_problem,
+                               std::vector<char>& row_sense,
+                               lp_problem_t<i_t, f_t>& problem,
+                               i_t& less_rows,
+                               std::vector<i_t>& new_slacks)
+{
+  constexpr bool verbose = false;
+  if (verbose) {
+    CUOPT_LOG_DEBUG("Converting %d less than inequalities to equalities\n", less_rows);
+  }
+  // We must convert rows in the form: a_i^T x <= beta
+  // into: a_i^T x + s_i = beta, s_i >= 0
+  std::vector<i_t> rows;
+  rows.reserve(less_rows);
+  for (i_t i = 0; i < problem.num_rows; i++) {
+    if (row_sense[i] == 'L') {
+      rows.push_back(i);
+      row_sense[i] = 'E';
+    }
+  }
+
+  insert_slack_columns(problem,
+                       rows,
+                       false,
+                       std::vector<f_t>(rows.size(), 0.0),
+                       std::vector<f_t>(rows.size(), INFINITY),
+                       new_slacks);
+  return 0;
+}
+
+template <typename i_t, typename f_t>
+i_t convert_greater_to_less(const user_problem_t<i_t, f_t>& user_problem,
+                            std::vector<char>& row_sense,
+                            lp_problem_t<i_t, f_t>& problem,
+                            i_t& greater_rows,
+                            i_t& less_rows)
+{
+  constexpr bool verbose = false;
+  if (verbose) {
+    printf("Transforming %d greater than constraints into less than constraints\n", greater_rows);
+  }
+  // We have a constraint in the form
+  // sum_{j : a_ij != 0} a_ij * x_j >= beta
+  // We transform this into the constraint
+  // sum_{j : a_ij != 0} -a_ij * x_j <= -beta
+
+  // First construct a compressed sparse row representation of the A matrix
+  csr_matrix_t<i_t, f_t> Arow(0, 0, 0);
+  problem.A.to_compressed_row(Arow);
+
+  for (i_t i = 0; i < problem.num_rows; i++) {
+    if (row_sense[i] == 'G') {
+      i_t row_start = Arow.row_start[i];
+      i_t row_end   = Arow.row_start[i + 1];
+      for (i_t p = Arow.row_start[i]; p < row_end; p++) {
+        Arow.x[p] *= -1;
+      }
+      problem.rhs[i] *= -1;
+      row_sense[i] = 'L';
+      greater_rows--;
+      less_rows++;
+    }
+  }
+
+  // Now convert the compressed sparse row representation back to compressed
+  // sparse column
+  Arow.to_compressed_col(problem.A);
+
+  return 0;
+}
+
+template <typename f_t>
+row_bounds_t<f_t> get_range_bounds_from_sense(char row_sense, f_t rhs, f_t range_value)
+{
+  const f_t abs_r = std::abs(range_value);
+  if (row_sense == 'L') { return {rhs - abs_r, rhs}; }
+  if (row_sense == 'G') { return {rhs, rhs + abs_r}; }
+  // 'E' with a range becomes a two-sided row
+  return range_value > 0 ? row_bounds_t<f_t>{rhs, rhs + abs_r}
+                         : row_bounds_t<f_t>{rhs - abs_r, rhs};
+}
+
+template <typename i_t, typename f_t>
+i_t convert_range_rows(const user_problem_t<i_t, f_t>& user_problem,
+                       std::vector<char>& row_sense,
+                       lp_problem_t<i_t, f_t>& problem,
+                       i_t& less_rows,
+                       i_t& equal_rows,
+                       i_t& greater_rows,
+                       std::vector<i_t>& new_slacks)
+{
+  // A range row has the format h_i <= a_i^T x <= u_i
+  // We must convert this into the constraint
+  // a_i^T x - s_i = 0
+  // h_i <= s_i <= u_i
+  // by adding a new slack variable s_i
+  //
+  // The values of h_i and u_i are determined by the b_i (RHS) and r_i (RANGES)
+  // associated with the ith constraint as well as the row sense
+  const i_t num_range_rows = user_problem.num_range_rows;
+  std::vector<i_t> rows(num_range_rows);
+  std::vector<f_t> lower(num_range_rows);
+  std::vector<f_t> upper(num_range_rows);
+  for (i_t k = 0; k < num_range_rows; k++) {
+    const i_t i         = user_problem.range_rows[k];
+    const f_t r         = user_problem.range_value[k];
+    const f_t b         = problem.rhs[i];
+    const auto [lo, hi] = get_range_bounds_from_sense(row_sense[i], b, r);
+    lower[k]            = lo;
+    upper[k]            = hi;
+    if (row_sense[i] == 'L') {
+      less_rows--;
+      equal_rows++;
+    } else if (row_sense[i] == 'G') {
+      greater_rows--;
+      equal_rows++;
+    }
+    rows[k]        = i;
+    problem.rhs[i] = 0.0;
+    row_sense[i]   = 'E';
+  }
+  insert_slack_columns(problem, rows, true, lower, upper, new_slacks);
+  return 0;
+}
+
+template <typename i_t, typename f_t>
+i_t find_dependent_rows(lp_problem_t<i_t, f_t>& problem,
+                        const simplex_solver_settings_t<i_t, f_t>& settings,
+                        std::vector<i_t>& dependent_rows,
+                        i_t& infeasible)
+{
+  i_t m  = problem.num_rows;
+  i_t n  = problem.num_cols;
+  i_t nz = problem.A.col_start[n];
+  assert(m == problem.A.m);
+  assert(n == problem.A.n);
+  dependent_rows.resize(m);
+
+  infeasible = -1;
+
+  // Form C = A'
+  csc_matrix_t<i_t, f_t> C(n, m, 1);
+  problem.A.transpose(C);
+  assert(C.col_start[m] == nz);
+
+  // Calculate L*U = C(p, :)
+  csc_matrix_t<i_t, f_t> L(n, m, nz);
+  csc_matrix_t<i_t, f_t> U(m, m, nz);
+  std::vector<i_t> pinv(n);
+  std::vector<i_t> q(m);
+
+  i_t pivots = right_looking_lu_row_permutation_only(C, settings, 1e-13, tic(), q, pinv);
+  if (pivots == CONCURRENT_HALT_RETURN) { return CONCURRENT_HALT_RETURN; }
+  if (pivots == TIME_LIMIT_RETURN) { return TIME_LIMIT_RETURN; }
+  if (pivots < m) {
+    settings.log.printf("Found %d dependent rows\n", m - pivots);
+    const i_t num_dependent = m - pivots;
+    std::vector<f_t> independent_rhs(pivots);
+    std::vector<f_t> dependent_rhs(num_dependent);
+    std::vector<i_t> dependent_row_list(num_dependent);
+    i_t ind_count = 0;
+    i_t dep_count = 0;
+    for (i_t i = 0; i < m; ++i) {
+      i_t row = q[i];
+      if (i < pivots) {
+        dependent_rows[row]          = 0;
+        independent_rhs[ind_count++] = problem.rhs[row];
+      } else {
+        dependent_rows[row]             = 1;
+        dependent_rhs[dep_count]        = problem.rhs[row];
+        dependent_row_list[dep_count++] = row;
+      }
+    }
+
+#if 0
+    std::vector<f_t> z = independent_rhs;
+    // Solve U1^T z = independent_rhs
+    for (i_t k = 0; k < pivots; ++k) {
+      const i_t col_start = U.col_start[k];
+      const i_t col_end   = U.col_start[k + 1];
+      for (i_t p = col_start; p < col_end; ++p) {
+        z[k] -= U.x[p] * z[U.i[p]];
+      }
+      z[k] /= U.x[col_end];
+    }
+
+    // Compute compare_dependent = U2^T z
+    std::vector<f_t> compare_dependent(num_dependent);
+    for (i_t k = pivots; k < m; ++k) {
+      f_t dot             = 0.0;
+      const i_t col_start = U.col_start[k];
+      const i_t col_end   = U.col_start[k + 1];
+      for (i_t p = col_start; p < col_end; ++p) {
+        dot += z[U.i[p]] * U.x[p];
+      }
+      compare_dependent[k - pivots] = dot;
+    }
+
+    for (i_t k = 0; k < m - pivots; ++k) {
+      if (std::abs(compare_dependent[k] - dependent_rhs[k]) > 1e-6) {
+        infeasible = dependent_row_list[k];
+        break;
+      } else {
+        problem.rhs[dependent_row_list[k]] = 0.0;
+      }
+    }
+#endif
+  } else {
+    settings.log.printf("No dependent rows found\n");
+  }
+  return pivots;
+}
+
+template <typename i_t, typename f_t>
+i_t add_artifical_variables(lp_problem_t<i_t, f_t>& problem,
+                            const std::vector<i_t>& range_rows,
+                            const std::vector<i_t>& equality_rows,
+                            std::vector<i_t>& new_slacks)
+{
+  const i_t n                   = problem.num_cols;
+  const i_t m                   = problem.num_rows;
+  const i_t num_artificial_vars = equality_rows.size() - range_rows.size();
+  const i_t num_cols            = n + num_artificial_vars;
+  i_t nnz                       = problem.A.col_start[n] + num_artificial_vars;
+  problem.A.col_start.resize(num_cols + 1);
+  problem.A.i.resize(nnz);
+  problem.A.x.resize(nnz);
+  problem.lower.resize(num_cols);
+  problem.upper.resize(num_cols);
+  problem.objective.resize(num_cols);
+
+  std::vector<bool> is_range_row(problem.num_rows, false);
+  for (i_t i : range_rows) {
+    is_range_row[i] = true;
+  }
+
+  i_t p = problem.A.col_start[n];
+  i_t j = n;
+  for (i_t i : equality_rows) {
+    if (is_range_row[i]) { continue; }
+    // Add an artifical variable z to the equation a_i^T x == b
+    // This now becomes a_i^T x + z == b,   0 <= z =< 0
+    problem.A.col_start[j] = p;
+    problem.A.i[p]         = i;
+    problem.A.x[p]         = 1.0;
+    problem.lower[j]       = 0.0;
+    problem.upper[j]       = 0.0;
+    problem.objective[j]   = 0.0;
+    new_slacks.push_back(j);
+    p++;
+    j++;
+  }
+  problem.A.col_start[num_cols] = p;
+  assert(j == num_cols);
+  assert(p == nnz);
+  constexpr bool verbose = false;
+  if (verbose) { printf("Added %d artificial variables\n", num_artificial_vars); }
+  problem.A.n      = num_cols;
+  problem.num_cols = num_cols;
+  return 0;
+}
+
+template <typename i_t, typename f_t>
+void convert_lp_to_user_problem(const lp_problem_t<i_t, f_t>& lp,
+                                const std::vector<variable_type_t>& var_types,
+                                const simplex_solver_settings_t<i_t, f_t>& settings,
+                                user_problem_t<i_t, f_t>& user_problem)
+{
+  constexpr bool verbose = false;
+  if (verbose) {
+    settings.log.printf("Converting simplex problem with %d rows and %d columns and %d nonzeros\n",
+                        lp.num_rows,
+                        lp.num_cols,
+                        lp.A.col_start[lp.num_cols]);
+  }
+
+  const i_t m = lp.num_rows;
+  const i_t n = lp.num_cols;
+
+  user_problem.handle_ptr = lp.handle_ptr;
+  user_problem.num_cols   = n;
+  user_problem.num_rows   = m;
+  user_problem.objective  = lp.objective;
+
+  user_problem.A = lp.A;
+
+  user_problem.rhs   = lp.rhs;
+  user_problem.lower = lp.lower;
+  user_problem.upper = lp.upper;
+  user_problem.row_sense.assign(m, 'E');
+  user_problem.range_rows.clear();
+  user_problem.range_value.clear();
+  user_problem.num_range_rows = 0;
+
+  user_problem.var_types = var_types;
+
+  user_problem.obj_scale             = lp.obj_scale;
+  user_problem.obj_constant          = lp.obj_constant;
+  user_problem.objective_is_integral = lp.objective_is_integral;
+  user_problem.objective_step        = lp.objective_step;
+
+  user_problem.Q_indices.clear();
+  user_problem.Q_offsets.clear();
+  user_problem.Q_values.clear();
+}
+
+template <typename i_t, typename f_t>
+void convert_user_problem(const user_problem_t<i_t, f_t>& user_problem,
+                          const simplex_solver_settings_t<i_t, f_t>& settings,
+                          lp_problem_t<i_t, f_t>& problem,
+                          std::vector<i_t>& new_slacks,
+                          dualize_info_t<i_t, f_t>& dualize_info)
+{
+  constexpr bool verbose = false;
+  if (verbose) {
+    settings.log.printf("Converting problem with %d rows and %d columns and %d nonzeros\n",
+                        user_problem.num_rows,
+                        user_problem.num_cols,
+                        user_problem.A.col_start[user_problem.num_cols]);
+  }
+
+  // Copy info from user_problem to problem
+  problem.num_rows               = user_problem.num_rows;
+  problem.num_cols               = user_problem.num_cols;
+  problem.A                      = user_problem.A;
+  problem.objective              = user_problem.objective;
+  problem.obj_scale              = user_problem.obj_scale;
+  problem.obj_constant           = user_problem.obj_constant;
+  problem.objective_is_integral  = user_problem.objective_is_integral;
+  problem.objective_step         = user_problem.objective_step;
+  problem.rhs                    = user_problem.rhs;
+  problem.lower                  = user_problem.lower;
+  problem.upper                  = user_problem.upper;
+  problem.cone_var_start         = user_problem.cone_var_start;
+  problem.second_order_cone_dims = user_problem.second_order_cone_dims;
+
+  if (user_problem.Q_values.size() > 0) {
+    settings.log.debug("Converting problem with %d quadratic nonzeros\n",
+                       user_problem.Q_values.size());
+    problem.Q.m      = user_problem.num_cols;
+    problem.Q.n      = user_problem.num_cols;
+    problem.Q.nz_max = user_problem.Q_values.size();
+    problem.Q.row_start.assign(user_problem.Q_offsets.begin(),
+                               user_problem.Q_offsets.begin() + user_problem.num_cols + 1);
+    problem.Q.j = user_problem.Q_indices;
+    problem.Q.x = user_problem.Q_values;
+  }
+
+  // Make a copy of row_sense so we can modify it
+  std::vector<char> row_sense = user_problem.row_sense;
+
+  // The original problem can have constraints in the form
+  // a_i^T x >= b, a_i^T x <= b, and a_i^T x == b
+  //
+  // we first restrict these to just
+  // a_i^T x <= b and a_i^T x == b
+  //
+  // We do this by working with the A matrix in csr format
+  // and negating coefficents in rows with >= or 'G' row sense
+  i_t greater_rows = 0;
+  i_t less_rows    = 0;
+  i_t equal_rows   = 0;
+  std::vector<i_t> equality_rows;
+  for (i_t i = 0; i < user_problem.num_rows; ++i) {
+    if (row_sense[i] == 'G') {
+      greater_rows++;
+    } else if (row_sense[i] == 'L') {
+      less_rows++;
+    } else {
+      equal_rows++;
+      equality_rows.push_back(i);
+    }
+  }
+  if (verbose) {
+    settings.log.printf("Constraints < %d = %d > %d\n", less_rows, equal_rows, greater_rows);
+  }
+
+  if (user_problem.num_range_rows > 0) {
+    if (verbose) { printf("Problem has %d range rows\n", user_problem.num_range_rows); }
+    convert_range_rows(
+      user_problem, row_sense, problem, less_rows, equal_rows, greater_rows, new_slacks);
+  }
+
+  if (greater_rows > 0) {
+    convert_greater_to_less(user_problem, row_sense, problem, greater_rows, less_rows);
+  }
+
+  constexpr bool run_bounds_strengthening = false;
+  if constexpr (run_bounds_strengthening) {
+    csr_matrix_t<i_t, f_t> Arow(1, 1, 1);
+    problem.A.to_compressed_row(Arow);
+
+    settings.log.printf("Running bound strengthening\n");
+
+    // Empty var_types means that all variables are continuous
+    bounds_strengthening_t<i_t, f_t> strengthening(problem, Arow, row_sense, {});
+    std::vector<bool> bounds_changed(problem.num_cols, true);
+    strengthening.bounds_strengthening(settings, bounds_changed, problem.lower, problem.upper);
+  }
+
+  settings.log.debug(
+    "equality rows %d less rows %d columns %d\n", equal_rows, less_rows, problem.num_cols);
+  if (settings.barrier && settings.dualize != 0 && user_problem.Q_values.size() == 0 &&
+      problem.second_order_cone_dims.empty() &&
+      (settings.dualize == 1 ||
+       (settings.dualize == -1 && less_rows > 1.2 * problem.num_cols && equal_rows < 2e4))) {
+    settings.log.debug("Dualizing in presolve\n");
+
+    i_t num_upper_bounds = 0;
+    std::vector<i_t> vars_with_upper_bounds;
+    vars_with_upper_bounds.reserve(problem.num_cols);
+    bool can_dualize = true;
+    for (i_t j = 0; j < problem.num_cols; j++) {
+      if (problem.lower[j] != 0.0) {
+        settings.log.debug("Variable %d has a nonzero lower bound %e\n", j, problem.lower[j]);
+        can_dualize = false;
+        break;
+      }
+      if (problem.upper[j] < inf) {
+        num_upper_bounds++;
+        vars_with_upper_bounds.push_back(j);
+      }
+    }
+
+    i_t max_column_nz = 0;
+    for (i_t j = 0; j < problem.num_cols; j++) {
+      const i_t col_nz = problem.A.col_start[j + 1] - problem.A.col_start[j];
+      max_column_nz    = std::max(col_nz, max_column_nz);
+    }
+
+    std::vector<i_t> row_degree(problem.num_rows, 0);
+    for (i_t j = 0; j < problem.num_cols; j++) {
+      const i_t col_start = problem.A.col_start[j];
+      const i_t col_end   = problem.A.col_start[j + 1];
+      for (i_t p = col_start; p < col_end; p++) {
+        row_degree[problem.A.i[p]]++;
+      }
+    }
+
+    i_t max_row_nz = 0;
+    for (i_t i = 0; i < problem.num_rows; i++) {
+      max_row_nz = std::max(row_degree[i], max_row_nz);
+    }
+    settings.log.debug("max row nz %d max col nz %d\n", max_row_nz, max_column_nz);
+
+    if (settings.dualize == -1 && max_row_nz > 1e4 && max_column_nz < max_row_nz) {
+      can_dualize = false;
+    }
+
+    if (can_dualize) {
+      // The problem is in the form
+      // minimize   c^T x
+      // subject to A_in * x <= b_in        : y_in
+      //            A_eq * x == b_eq        : y_eq
+      //            0 <= x                  : z_l
+      //            x_j <= u_j, for j in U  : z_u
+      //
+      // The dual is of the form
+      // maximize    -b_in^T y_in - b_eq^T y_eq + 0^T z_l - u^T z_u
+      // subject to  -A_in^T y_in - A_eq^T y_eq + z_l - z_u = c
+      //             y_in >= 0
+      //             y_eq free
+      //             z_l >= 0
+      //             z_u >= 0
+      //
+      // Since the solvers expect the problem to be in minimization form,
+      // we convert this to
+      //
+      // minimize    b_in^T y_in + b_eq^T y_eq - 0^T z_l + u^T z_u
+      // subject to  -A_in^T y_in - A_eq^T y_eq + z_l - z_u = c  : x
+      //             y_in >= 0 : x_in
+      //             y_eq free
+      //             z_l >= 0 : x_l
+      //             z_u >= 0 : x_u
+      //
+      // The dual of this problem is of the form
+      //
+      // maximize    -c^T x
+      // subject to   A_in * x + x_in = b_in   <=> A_in * x <= b_in
+      //              A_eq * x = b_eq
+      //              x + x_u = u              <=> x <= u
+      //              x = x_l                  <=> x >= 0
+      //              x free, x_in >= 0, x_l >- 0, x_u >= 0
+      i_t dual_rows = problem.num_cols;
+      i_t dual_cols = problem.num_rows + problem.num_cols + num_upper_bounds;
+      lp_problem_t<i_t, f_t> dual_problem(problem.handle_ptr, 1, 1, 0);
+      csc_matrix_t<i_t, f_t> dual_constraint_matrix(1, 1, 0);
+      problem.A.transpose(dual_constraint_matrix);
+      // dual_constraint_matrix <- [-A^T I I]
+      dual_constraint_matrix.m = dual_rows;
+      dual_constraint_matrix.n = dual_cols;
+      i_t nnz                  = dual_constraint_matrix.col_start[problem.num_rows];
+      i_t new_nnz              = nnz + problem.num_cols + num_upper_bounds;
+      dual_constraint_matrix.col_start.resize(dual_cols + 1);
+      dual_constraint_matrix.i.resize(new_nnz);
+      dual_constraint_matrix.x.resize(new_nnz);
+      for (i_t p = 0; p < nnz; p++) {
+        dual_constraint_matrix.x[p] *= -1.0;
+      }
+      i_t i = 0;
+      for (i_t j = problem.num_rows; j < problem.num_rows + problem.num_cols; j++) {
+        dual_constraint_matrix.col_start[j] = nnz;
+        dual_constraint_matrix.i[nnz]       = i++;
+        dual_constraint_matrix.x[nnz]       = 1.0;
+        nnz++;
+      }
+      for (i_t k = 0; k < num_upper_bounds; k++) {
+        i_t p                               = problem.num_rows + problem.num_cols + k;
+        dual_constraint_matrix.col_start[p] = nnz;
+        dual_constraint_matrix.i[nnz]       = vars_with_upper_bounds[k];
+        dual_constraint_matrix.x[nnz]       = -1.0;
+        nnz++;
+      }
+      dual_constraint_matrix.col_start[dual_cols] = nnz;
+      settings.log.debug("dual_constraint_matrix nnz %d predicted %d\n", nnz, new_nnz);
+      dual_problem.num_rows = dual_rows;
+      dual_problem.num_cols = dual_cols;
+      dual_problem.objective.resize(dual_cols, 0.0);
+      for (i_t j = 0; j < problem.num_rows; j++) {
+        dual_problem.objective[j] = problem.rhs[j];
+      }
+      for (i_t k = 0; k < num_upper_bounds; k++) {
+        i_t j                     = problem.num_rows + problem.num_cols + k;
+        dual_problem.objective[j] = problem.upper[vars_with_upper_bounds[k]];
+      }
+      dual_problem.A     = dual_constraint_matrix;
+      dual_problem.rhs   = problem.objective;
+      dual_problem.lower = std::vector<f_t>(dual_cols, 0.0);
+      dual_problem.upper = std::vector<f_t>(dual_cols, inf);
+      for (i_t j : equality_rows) {
+        dual_problem.lower[j] = -inf;
+      }
+      dual_problem.obj_constant = 0.0;
+      dual_problem.obj_scale    = -1.0;
+
+      equal_rows = problem.num_cols;
+      less_rows  = 0;
+
+      dualize_info.vars_with_upper_bounds = vars_with_upper_bounds;
+      dualize_info.zl_start               = problem.num_rows;
+      dualize_info.zu_start               = problem.num_rows + problem.num_cols;
+      dualize_info.equality_rows          = equality_rows;
+      dualize_info.primal_problem         = problem;
+      dualize_info.solving_dual           = true;
+
+      problem = dual_problem;
+
+      settings.log.printf("Solving the dual\n");
+    }
+  }
+
+  if (less_rows > 0) {
+    convert_less_than_to_equal(user_problem, row_sense, problem, less_rows, new_slacks);
+  }
+
+  // Add artifical variables
+  if (!settings.barrier_presolve) {
+    add_artifical_variables(problem, user_problem.range_rows, equality_rows, new_slacks);
+  }
+}
+
+template <typename i_t, typename f_t>
+i_t presolve(const lp_problem_t<i_t, f_t>& original,
+             const simplex_solver_settings_t<i_t, f_t>& settings,
+             lp_problem_t<i_t, f_t>& problem,
+             presolve_info_t<i_t, f_t>& presolve_info)
+{
+  problem              = original;
+  i_t linear_cols      = linear_variable_count(problem);
+  const bool has_cones = !problem.second_order_cone_dims.empty();
+  std::vector<char> row_sense(problem.num_rows, '=');
+
+  // Check for free variables (linear block only; cone columns are handled by the barrier SOC
+  // layout)
+  i_t free_variables = 0;
+  for (i_t j = 0; j < linear_cols; j++) {
+    if (problem.lower[j] == -inf && problem.upper[j] == inf) { free_variables++; }
+  }
+
+  if (settings.barrier_presolve && settings.barrier_presolve_bound_free_variables != 0 &&
+      free_variables > 0) {
+    // Try to remove free variables
+    std::vector<i_t> constraints_to_check;
+    std::vector<i_t> current_free_variables;
+    std::vector<i_t> row_marked(problem.num_rows, 0);
+    current_free_variables.reserve(problem.num_cols);
+    constraints_to_check.reserve(problem.num_rows);
+    for (i_t j = 0; j < linear_cols; j++) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf) {
+        current_free_variables.push_back(j);
+        const i_t col_start = problem.A.col_start[j];
+        const i_t col_end   = problem.A.col_start[j + 1];
+        for (i_t p = col_start; p < col_end; p++) {
+          const i_t i = problem.A.i[p];
+          if (row_marked[i] == 0) {
+            row_marked[i] = 1;
+            constraints_to_check.push_back(i);
+          }
+        }
+      }
+    }
+
+    i_t removed_free_variables = 0;
+
+    // Track which constraint provided each implied bound for dual correction
+    std::vector<i_t> lower_bound_constraint(problem.num_cols, -1);
+    std::vector<f_t> lower_bound_coefficient(problem.num_cols, 0.0);
+    std::vector<i_t> upper_bound_constraint(problem.num_cols, -1);
+    std::vector<f_t> upper_bound_coefficient(problem.num_cols, 0.0);
+
+    if (!constraints_to_check.empty()) {
+      // Check if the constraints are feasible
+      csr_matrix_t<i_t, f_t> Arow(0, 0, 0);
+      problem.A.to_compressed_row(Arow);
+
+      // Keep only rows safe for bound inference: no cone columns
+      if (has_cones) {
+        std::vector<i_t> safe_constraints;
+        safe_constraints.reserve(constraints_to_check.size());
+        for (i_t i : constraints_to_check) {
+          bool touches_cone = false;
+          for (i_t p = Arow.row_start[i]; p < Arow.row_start[i + 1]; ++p) {
+            const i_t j = Arow.j[p];
+            if (j >= linear_cols) {
+              touches_cone = true;
+              continue;
+            }
+          }
+          if (touches_cone) { continue; }
+          safe_constraints.push_back(i);
+        }
+        constraints_to_check.swap(safe_constraints);
+      }
+
+      // The constraints are in the form:
+      // sum_j a_j x_j = beta
+      for (i_t i : constraints_to_check) {
+        const i_t row_start   = Arow.row_start[i];
+        const i_t row_end     = Arow.row_start[i + 1];
+        f_t lower_activity_i  = 0.0;
+        f_t upper_activity_i  = 0.0;
+        i_t lower_inf_i       = 0;
+        i_t upper_inf_i       = 0;
+        i_t last_free_i       = -1;
+        f_t last_free_coeff_i = 0.0;
+        for (i_t p = row_start; p < row_end; p++) {
+          const i_t j = Arow.j[p];
+          if (j >= linear_cols) { continue; }
+          const f_t aij     = Arow.x[p];
+          const f_t lower_j = problem.lower[j];
+          const f_t upper_j = problem.upper[j];
+          if (lower_j == -inf && upper_j == inf) {
+            last_free_i       = j;
+            last_free_coeff_i = aij;
+          }
+          if (aij > 0) {
+            if (lower_j > -inf) {
+              lower_activity_i += aij * lower_j;
+            } else {
+              lower_inf_i++;
+            }
+            if (upper_j < inf) {
+              upper_activity_i += aij * upper_j;
+            } else {
+              upper_inf_i++;
+            }
+          } else {
+            if (upper_j < inf) {
+              lower_activity_i += aij * upper_j;
+            } else {
+              lower_inf_i++;
+            }
+            if (lower_j > -inf) {
+              upper_activity_i += aij * lower_j;
+            } else {
+              upper_inf_i++;
+            }
+          }
+        }
+
+        if (last_free_i == -1) { continue; }
+
+        // sum_j a_ij x_j == beta
+
+        const f_t rhs = problem.rhs[i];
+        // sum_{k != j} a_ik x_k + a_ij x_j == rhs
+        // Suppose that -inf < x_j < inf  and all other variables x_k with k != j are bounded
+        // a_ij x_j == rhs - sum_{k != j} a_ik x_k
+        // So if a_ij > 0, we have
+        //  x_j == 1/a_ij * (rhs - sum_{k != j} a_ik x_k)
+        // We can derive two bounds from  this:
+        // x_j <= 1/a_ij * (rhs - lower_activity_i) and
+        // x_j >= 1/a_ij * (rhs - upper_activity_i)
+
+        // If a_ij < 0, we have
+        // x_j == 1/a_ij * (rhs - sum_{k != j} a_ik x_k
+        // And we can derive two bounds from this:
+        // x_j >= 1/a_ij * (rhs - lower_activity_i)
+        // x_j <= 1/a_ij * (rhs - upper_activity_i)
+        const i_t j    = last_free_i;
+        const f_t a_ij = last_free_coeff_i;
+        if (a_ij == 0) { continue; }
+        const f_t max_bound = 1e10;
+        bool bounded        = false;
+        if (a_ij > 0) {
+          if (lower_inf_i == 1) {
+            const f_t new_upper = 1.0 / a_ij * (rhs - lower_activity_i);
+            if (new_upper < max_bound) {
+              problem.upper[j]           = new_upper;
+              upper_bound_constraint[j]  = i;
+              upper_bound_coefficient[j] = a_ij;
+              bounded                    = true;
+            }
+          }
+          if (upper_inf_i == 1) {
+            const f_t new_lower = 1.0 / a_ij * (rhs - upper_activity_i);
+            if (new_lower > -max_bound) {
+              problem.lower[j]           = new_lower;
+              lower_bound_constraint[j]  = i;
+              lower_bound_coefficient[j] = a_ij;
+              bounded                    = true;
+            }
+          }
+        } else if (a_ij < 0) {
+          if (lower_inf_i == 1) {
+            const f_t new_lower = 1.0 / a_ij * (rhs - lower_activity_i);
+            if (new_lower > -max_bound) {
+              problem.lower[j]           = new_lower;
+              lower_bound_constraint[j]  = i;
+              lower_bound_coefficient[j] = a_ij;
+              bounded                    = true;
+            }
+          }
+          if (upper_inf_i == 1) {
+            const f_t new_upper = 1.0 / a_ij * (rhs - upper_activity_i);
+            if (new_upper < max_bound) {
+              problem.upper[j]           = new_upper;
+              upper_bound_constraint[j]  = i;
+              upper_bound_coefficient[j] = a_ij;
+              bounded                    = true;
+            }
+          }
+        }
+
+        if (bounded) { removed_free_variables++; }
+      }
+    }
+
+    for (i_t j : current_free_variables) {
+      if (problem.lower[j] > -inf && problem.upper[j] < inf) {
+        // We don't need two bounds. Pick the smallest one.
+        if (std::abs(problem.lower[j]) < std::abs(problem.upper[j])) {
+          // Restore the inf in the upper bound. Barrier will not require an additional w variable
+          problem.upper[j] = inf;
+        } else {
+          // Restores the -inf in the lower bound. Barrier will require an additional w variable
+          problem.lower[j] = -inf;
+        }
+      }
+    }
+
+    // Record bounded free variables for dual correction in uncrush.
+    // After the keep-one-bound logic, each bounded variable has exactly one finite bound.
+    for (i_t j : current_free_variables) {
+      i_t bounding_constraint  = -1;
+      f_t bounding_coefficient = 0.0;
+      if (problem.lower[j] > -inf && lower_bound_constraint[j] != -1) {
+        bounding_constraint  = lower_bound_constraint[j];
+        bounding_coefficient = lower_bound_coefficient[j];
+      } else if (problem.upper[j] < inf && upper_bound_constraint[j] != -1) {
+        bounding_constraint  = upper_bound_constraint[j];
+        bounding_coefficient = upper_bound_coefficient[j];
+      }
+      if (bounding_constraint != -1) {
+        presolve_info.bounded_free_variables.push_back(
+          {j, bounding_constraint, bounding_coefficient});
+      }
+    }
+
+    free_variables = 0;
+    for (i_t j = 0; j < problem.num_cols; j++) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf) { free_variables++; }
+    }
+    if (removed_free_variables != 0) {
+      settings.log.printf("Bounded %d free variables in presolve\n",
+                          static_cast<int>(removed_free_variables));
+    }
+  }
+
+  // The original problem may have a variable without a lower bound
+  // but a finite upper bound
+  // -inf < x_j <= u_j (linear variables only)
+  i_t no_lower_bound = 0;
+  for (i_t j = 0; j < linear_cols; j++) {
+    if (problem.lower[j] == -inf && problem.upper[j] < inf) { no_lower_bound++; }
+  }
+
+  if (no_lower_bound > 0) {
+    settings.log.printf("%d variables with no lower bound\n", no_lower_bound);
+  }
+
+  // Handle -inf < x_j <= u_j by substituting x'_j = -x_j, giving -u_j <= x'_j < inf
+  if (settings.barrier_presolve && no_lower_bound > 0) {
+    presolve_info.negated_variables.reserve(no_lower_bound);
+    for (i_t j = 0; j < linear_cols; j++) {
+      if (problem.lower[j] == -inf && problem.upper[j] < inf) {
+        presolve_info.negated_variables.push_back(j);
+
+        problem.lower[j] = -problem.upper[j];
+        problem.upper[j] = inf;
+        problem.objective[j] *= -1;
+
+        const i_t col_start = problem.A.col_start[j];
+        const i_t col_end   = problem.A.col_start[j + 1];
+        for (i_t p = col_start; p < col_end; p++) {
+          problem.A.x[p] *= -1.0;
+        }
+      }
+    }
+
+    // (1/2) x^T Q x with x = D x' (D_ii = -1 for negated columns) is (1/2) x'^T D Q D x'.
+    // One pass: Q'_{ik} = D_{ii} D_{kk} Q_{ik} — flip iff exactly one of {i,k} is negated.
+    if (problem.Q.n > 0 && !presolve_info.negated_variables.empty()) {
+      std::vector<bool> is_negated(static_cast<size_t>(problem.num_cols), false);
+      for (i_t const j : presolve_info.negated_variables) {
+        is_negated[j] = true;
+      }
+      for (i_t row = 0; row < problem.Q.m; ++row) {
+        const i_t q_start         = problem.Q.row_start[row];
+        const i_t q_end           = problem.Q.row_start[row + 1];
+        const bool is_negated_row = is_negated[row];
+        for (i_t p = q_start; p < q_end; ++p) {
+          const i_t col = problem.Q.j[p];
+          if (is_negated_row != is_negated[col]) { problem.Q.x[p] *= -1.0; }
+        }
+      }
+    }
+  }
+
+  // The original problem may have nonzero lower bounds
+  // 0 != l_j <= x_j <= u_j
+  i_t nonzero_lower_bounds = 0;
+  for (i_t j = 0; j < linear_cols; j++) {
+    if (problem.lower[j] != 0.0 && problem.lower[j] > -inf) { nonzero_lower_bounds++; }
+  }
+  if (settings.barrier_presolve && nonzero_lower_bounds > 0) {
+    settings.log.printf("Transforming %ld nonzero lower bound\n", nonzero_lower_bounds);
+    presolve_info.removed_lower_bounds.resize(problem.num_cols);
+    // We can construct a new variable: x'_j = x_j - l_j or x_j = x'_j + l_j
+    // than we have 0 <= x'_j <= u_j - l_j
+    // Constraints in the form:
+    //  sum_{k != j} a_ik x_k + a_ij * x_j {=, <=} beta_i
+    //  become
+    //  sum_{k != j} a_ik x_k + a_ij * (x'_j + l_j) {=, <=} beta_i
+    //  or
+    //  sum_{k != j} a_ik x_k + a_ij * x'_j {=, <=} beta_i - a_{ij} l_j
+    //
+    // the cost function
+    // sum_{k != j} c_k x_k + c_j * x_j
+    // becomes
+    // sum_{k != j} c_k x_k + c_j (x'_j + l_j)
+    //
+    // so we get the constant term c_j * l_j
+
+    std::vector<bool> lower_bounds_removed(problem.num_cols, false);
+    for (i_t j = 0; j < linear_cols; j++) {
+      if (problem.lower[j] != 0.0 && problem.lower[j] > -inf) {
+        lower_bounds_removed[j]               = true;
+        presolve_info.removed_lower_bounds[j] = problem.lower[j];
+      }
+    }
+
+    auto old_objective = problem.objective;
+    if (problem.Q.n > 0) {
+      for (i_t row = 0; row < linear_cols; row++) {
+        i_t row_start = problem.Q.row_start[row];
+        i_t row_end   = problem.Q.row_start[row + 1];
+        for (i_t p = row_start; p < row_end; p++) {
+          i_t col = problem.Q.j[p];
+          f_t qij = problem.Q.x[p];
+
+          if (lower_bounds_removed[row]) {
+            problem.objective[col] += 0.5 * qij * problem.lower[row];
+          }
+          if (lower_bounds_removed[col]) {
+            problem.objective[row] += 0.5 * qij * problem.lower[col];
+          }
+          if (lower_bounds_removed[row] && lower_bounds_removed[col]) {
+            problem.obj_constant += 0.5 * qij * problem.lower[row] * problem.lower[col];
+          }
+        }
+      }
+    }
+
+    std::vector<f_t> kahan_compensation(problem.num_rows, 0.0);
+    for (i_t j = 0; j < linear_cols; j++) {
+      if (lower_bounds_removed[j]) {
+        i_t col_start = problem.A.col_start[j];
+        i_t col_end   = problem.A.col_start[j + 1];
+        for (i_t p = col_start; p < col_end; p++) {
+          i_t i                 = problem.A.i[p];
+          f_t aij               = problem.A.x[p];
+          f_t val               = -aij * problem.lower[j];
+          f_t y                 = val - kahan_compensation[i];
+          f_t t                 = problem.rhs[i] + y;
+          kahan_compensation[i] = (t - problem.rhs[i]) - y;
+          problem.rhs[i]        = t;
+        }
+        problem.obj_constant += old_objective[j] * problem.lower[j];
+        problem.upper[j] -= problem.lower[j];
+        problem.lower[j] = 0.0;
+      }
+    }
+  }
+
+  // Check for empty rows
+  i_t num_empty_rows = 0;
+  {
+    csr_matrix_t<i_t, f_t> Arow(0, 0, 0);
+    problem.A.to_compressed_row(Arow);
+    for (i_t i = 0; i < problem.num_rows; i++) {
+      if (Arow.row_start[i + 1] - Arow.row_start[i] == 0) { num_empty_rows++; }
+    }
+  }
+  if (num_empty_rows > 0) {
+    settings.log.printf("Presolve removing %d empty rows\n", num_empty_rows);
+    i_t i = remove_empty_rows(problem, row_sense, num_empty_rows, presolve_info);
+    if (i != 0) { return -1; }
+  }
+
+  // Check for empty cols
+  i_t num_empty_cols = 0;
+  {
+    for (i_t j = 0; j < linear_cols; ++j) {
+      if ((problem.A.col_start[j + 1] - problem.A.col_start[j]) == 0) { num_empty_cols++; }
+    }
+  }
+  if (num_empty_cols > 0) {
+    settings.log.printf("Presolve attempt to remove %d empty cols\n", num_empty_cols);
+    remove_empty_cols(problem, num_empty_cols, presolve_info, linear_cols);
+  }
+
+  // Check for free variables (exclude cone variables — they are naturally unbounded)
+  free_variables = 0;
+  for (i_t j = 0; j < linear_cols; j++) {
+    if (problem.lower[j] == -inf && problem.upper[j] == inf) { free_variables++; }
+  }
+  problem.Q.check_matrix("Before free variable expansion");
+
+  // Free linear variables. QP/SOCP keep them. A sequence LP does too: the v-w split would
+  // change the cached columns. barrier_eliminate_free_variables is false only on that path.
+  const bool direct_free_linear =
+    settings.barrier_presolve && free_variables > 0 &&
+    (problem.Q.n > 0 || has_cones || !settings.barrier_eliminate_free_variables);
+  if (direct_free_linear) {
+    presolve_info.free_variable_pairs.clear();
+    presolve_info.direct_free_variables.clear();
+    // Only free linear decision variables need to be handled; cone/stack columns
+    // are unbounded by construction and must not be counted here.
+    i_t direct_free_count = 0;
+    for (i_t j = 0; j < linear_cols; j++) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf) {
+        presolve_info.direct_free_variables.push_back(j);
+        direct_free_count++;
+      }
+    }
+    settings.log.printf("Handling %d free variables directly in augmented system\n",
+                        direct_free_count);
+  } else if (settings.barrier_presolve && !has_cones && free_variables > 0) {
+    // For pure LP problems (Q is empty and there are no cones in this branch)
+    // We have a variable x_j: with -inf < x_j < inf
+    // we create new variables v and w with 0 <= v, w and x_j = v - w
+    // Constraints
+    // sum_{k != j} a_ik x_k + a_ij x_j {=, <=} beta
+    // become
+    // sum_{k != j} a_ik x_k + aij v - a_ij w {=, <=} beta
+    //
+    // The cost function
+    // sum_{k != j} c_k x_k + c_j x_j
+    // becomes
+    // sum_{k != j} c_k x_k + c_j v - c_j w
+
+    i_t num_cols = problem.num_cols + free_variables;
+    i_t nnz      = problem.A.col_start[problem.num_cols];
+    for (i_t j = 0; j < problem.num_cols; j++) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf) {
+        nnz += (problem.A.col_start[j + 1] - problem.A.col_start[j]);
+      }
+    }
+
+    problem.A.col_start.resize(num_cols + 1);
+    problem.A.i.resize(nnz);
+    problem.A.x.resize(nnz);
+    problem.lower.resize(num_cols);
+    problem.upper.resize(num_cols);
+    problem.objective.resize(num_cols);
+
+    presolve_info.free_variable_pairs.resize(free_variables * 2);
+    i_t pair_count = 0;
+    i_t q          = problem.A.col_start[problem.num_cols];
+    i_t col        = problem.num_cols;
+    for (i_t j = 0; j < problem.num_cols; j++) {
+      if (problem.lower[j] == -inf && problem.upper[j] == inf) {
+        for (i_t p = problem.A.col_start[j]; p < problem.A.col_start[j + 1]; p++) {
+          i_t i          = problem.A.i[p];
+          f_t aij        = problem.A.x[p];
+          problem.A.i[q] = i;
+          problem.A.x[q] = -aij;
+          q++;
+        }
+        problem.lower[col]                              = 0.0;
+        problem.upper[col]                              = inf;
+        problem.objective[col]                          = -problem.objective[j];
+        presolve_info.free_variable_pairs[pair_count++] = j;
+        presolve_info.free_variable_pairs[pair_count++] = col;
+        problem.A.col_start[++col]                      = q;
+        problem.lower[j]                                = 0.0;
+      }
+    }
+
+    problem.A.n      = num_cols;
+    problem.num_cols = num_cols;
+  }
+
+  if (settings.barrier_presolve && settings.folding != 0 && problem.Q.n == 0 && !has_cones) {
+    folding(problem, settings, presolve_info);
+  }
+
+  // Check for dependent rows
+  bool check_dependent_rows = false;
+  if (check_dependent_rows) {
+    std::vector<i_t> dependent_rows;
+    constexpr i_t kOk = -1;
+    i_t infeasible;
+    f_t dependent_row_start    = tic();
+    const i_t independent_rows = find_dependent_rows(problem, settings, dependent_rows, infeasible);
+    if (independent_rows == CONCURRENT_HALT_RETURN) { return CONCURRENT_HALT_RETURN; }
+    if (independent_rows == TIME_LIMIT_RETURN) { return TIME_LIMIT_RETURN; }
+    if (infeasible != kOk) {
+      settings.log.printf("Found problem infeasible in presolve\n");
+      return -1;
+    }
+    if (independent_rows < problem.num_rows) {
+      const i_t num_dependent_rows = problem.num_rows - independent_rows;
+      settings.log.printf("%d dependent rows\n", num_dependent_rows);
+      csr_matrix_t<i_t, f_t> Arow(0, 0, 0);
+      problem.A.to_compressed_row(Arow);
+      remove_rows(problem, row_sense, Arow, dependent_rows, false);
+    }
+    settings.log.printf("Dependent row check in %.2fs\n", toc(dependent_row_start));
+  }
+
+  // LP already goes through PSLP; this substitution is for QP/SOCP only. A cache fill skips it.
+  if (settings.barrier_presolve && settings.barrier_eliminate_free_variables &&
+      (has_cones || problem.Q.n > 0)) {
+    const i_t old_free_count         = static_cast<i_t>(presolve_info.direct_free_variables.size());
+    const f_t free_elimination_start = tic();
+    const i_t pivot_rejected         = eliminate_free_variables(problem, presolve_info);
+    const i_t eliminated =
+      old_free_count - static_cast<i_t>(presolve_info.direct_free_variables.size());
+    if (eliminated > 0 || pivot_rejected > 0) {
+      settings.log.printf(
+        "Eliminated %d free variables by equality substitution (%d skipped by pivot "
+        "threshold) in %.2fs\n",
+        eliminated,
+        pivot_rejected,
+        toc(free_elimination_start));
+    }
+  }
+
+  assert(problem.num_rows == problem.A.m);
+  assert(problem.num_cols == problem.A.n);
+  if (settings.print_presolve_stats && problem.A.m < original.A.m) {
+    settings.log.printf("Presolve eliminated %d constraints\n", original.A.m - problem.A.m);
+  }
+  if (settings.print_presolve_stats && problem.A.n < original.A.n) {
+    settings.log.printf("Presolve eliminated %d variables\n", original.A.n - problem.A.n);
+  }
+  if (settings.print_presolve_stats) {
+    settings.log.printf("Presolved problem: %d constraints %d variables %d nonzeros\n",
+                        problem.A.m,
+                        problem.A.n,
+                        problem.A.col_start[problem.A.n]);
+  }
+  assert(problem.rhs.size() == problem.A.m);
+  return 0;
+}
+
+template <typename i_t, typename f_t>
+void convert_user_lp_with_guess(const user_problem_t<i_t, f_t>& user_problem,
+                                const lp_solution_t<i_t, f_t>& initial_solution,
+                                const std::vector<f_t>& initial_slack,
+                                lp_problem_t<i_t, f_t>& problem,
+                                lp_solution_t<i_t, f_t>& converted_solution)
+{
+  std::vector<i_t> new_slacks;
+  simplex_solver_settings_t<i_t, f_t> settings;
+  dualize_info_t<i_t, f_t> dualize_info;
+  convert_user_problem(user_problem, settings, problem, new_slacks, dualize_info);
+  crush_primal_solution_with_slack(
+    user_problem, problem, initial_solution.x, initial_slack, new_slacks, converted_solution.x);
+  crush_dual_solution(user_problem,
+                      problem,
+                      new_slacks,
+                      initial_solution.y,
+                      initial_solution.z,
+                      converted_solution.y,
+                      converted_solution.z);
+}
+
+template <typename i_t, typename f_t>
+void crush_primal_solution(const user_problem_t<i_t, f_t>& user_problem,
+                           const lp_problem_t<i_t, f_t>& problem,
+                           const std::vector<f_t>& user_solution,
+                           const std::vector<i_t>& new_slacks,
+                           std::vector<f_t>& solution)
+{
+  // Re-crush can be called with a reused output vector; make sure all entries,
+  // including previously added slacks, are reset before writing new values.
+  solution.assign(problem.num_cols, 0.0);
+  for (i_t j = 0; j < user_problem.num_cols; j++) {
+    solution[user_col_to_problem_col(user_problem, problem, j)] = user_solution[j];
+  }
+
+  std::vector<f_t> primal_residual(problem.num_rows);
+  // Compute r = A*x
+  matrix_vector_multiply(problem.A, 1.0, solution, 0.0, primal_residual);
+
+  // Compute the value for each of the added slack variables
+  for (i_t j : new_slacks) {
+    const i_t col_start = problem.A.col_start[j];
+    const i_t col_end   = problem.A.col_start[j + 1];
+    const i_t diff      = col_end - col_start;
+    assert(diff == 1);
+    const i_t i = problem.A.i[col_start];
+    assert(solution[j] == 0.0);
+    const f_t beta  = problem.rhs[i];
+    const f_t alpha = problem.A.x[col_start];
+    assert(alpha == 1.0 || alpha == -1.0);
+    const f_t slack_computed = (beta - primal_residual[i]) / alpha;
+    solution[j] = std::max(problem.lower[j], std::min(slack_computed, problem.upper[j]));
+  }
+
+  primal_residual = problem.rhs;
+  matrix_vector_multiply(problem.A, 1.0, solution, -1.0, primal_residual);
+  const f_t primal_res   = vector_norm_inf<i_t, f_t>(primal_residual);
+  constexpr bool verbose = false;
+  if (verbose) { printf("Converted solution || A*x - b || %e\n", primal_res); }
+}
+
+template <typename i_t, typename f_t>
+void crush_primal_solution_with_slack(const user_problem_t<i_t, f_t>& user_problem,
+                                      const lp_problem_t<i_t, f_t>& problem,
+                                      const std::vector<f_t>& user_solution,
+                                      const std::vector<f_t>& user_slack,
+                                      const std::vector<i_t>& new_slacks,
+                                      std::vector<f_t>& solution)
+{
+  // Re-crush can be called with a reused output vector; clear stale entries first.
+  solution.assign(problem.num_cols, 0.0);
+  for (i_t j = 0; j < user_problem.num_cols; j++) {
+    solution[user_col_to_problem_col(user_problem, problem, j)] = user_solution[j];
+  }
+
+  std::vector<f_t> primal_residual(problem.num_rows);
+  // Compute r = A*x
+  matrix_vector_multiply(problem.A, 1.0, solution, 0.0, primal_residual);
+
+  constexpr bool verbose = false;
+  // Compute the value for each of the added slack variables
+  for (i_t j : new_slacks) {
+    const i_t col_start = problem.A.col_start[j];
+    const i_t col_end   = problem.A.col_start[j + 1];
+    const i_t diff      = col_end - col_start;
+    assert(diff == 1);
+    const i_t i = problem.A.i[col_start];
+    assert(solution[j] == 0.0);
+    const f_t si    = user_slack[i];
+    const f_t beta  = problem.rhs[i];
+    const f_t alpha = problem.A.x[col_start];
+    assert(alpha == 1.0 || alpha == -1.0);
+    const f_t slack_computed = (beta - primal_residual[i]) / alpha;
+    if (std::abs(si - slack_computed) > 1e-6) {
+      if (verbose) { printf("Slacks differ %d %e %e\n", j, si, slack_computed); }
+    }
+    solution[j] = si;
+  }
+
+  primal_residual = problem.rhs;
+  matrix_vector_multiply(problem.A, 1.0, solution, -1.0, primal_residual);
+  const f_t primal_res = vector_norm_inf<i_t, f_t>(primal_residual);
+  if (verbose) { printf("Converted solution || A*x - b || %e\n", primal_res); }
+  assert(primal_res < 1e-6);
+}
+
+template <typename i_t, typename f_t>
+f_t crush_dual_solution(const user_problem_t<i_t, f_t>& user_problem,
+                        const lp_problem_t<i_t, f_t>& problem,
+                        const std::vector<i_t>& new_slacks,
+                        const std::vector<f_t>& user_y,
+                        const std::vector<f_t>& user_z,
+                        std::vector<f_t>& y,
+                        std::vector<f_t>& z)
+{
+  y.resize(problem.num_rows);
+  for (i_t i = 0; i < user_problem.num_rows; i++) {
+    y[i] = user_y[i];
+  }
+  z.assign(problem.num_cols, 0.0);
+  for (i_t j = 0; j < user_problem.num_cols; j++) {
+    z[user_col_to_problem_col(user_problem, problem, j)] = user_z[j];
+  }
+
+  std::vector<bool> is_range_row(problem.num_rows, false);
+  for (i_t i = 0; i < user_problem.range_rows.size(); i++) {
+    is_range_row[user_problem.range_rows[i]] = true;
+  }
+  assert(user_problem.num_rows == problem.num_rows);
+
+  for (i_t j : new_slacks) {
+    const i_t col_start = problem.A.col_start[j];
+    const i_t col_end   = problem.A.col_start[j + 1];
+    const i_t diff      = col_end - col_start;
+    assert(diff == 1);
+    const i_t i = problem.A.i[col_start];
+
+    // A^T y + z = c
+    // e_i^T y + z_j = c_j = 0
+    // y_i + z_j = 0
+    // z_j = - y_i;
+    if (is_range_row[i]) {
+      z[j] = y[i];
+    } else {
+      z[j] = -y[i];
+    }
+  }
+
+  // A^T y + z = c or A^T y + z - c = 0
+  std::vector<f_t> dual_residual = z;
+  for (i_t j = 0; j < problem.num_cols; j++) {
+    dual_residual[j] -= problem.objective[j];
+  }
+  matrix_transpose_vector_multiply(problem.A, 1.0, y, 1.0, dual_residual);
+  constexpr bool verbose = false;
+  if (verbose) {
+    printf("Converted solution || A^T y + z - c || %e\n", vector_norm_inf<i_t, f_t>(dual_residual));
+  }
+  for (i_t j = 0; j < problem.num_cols; ++j) {
+    if (std::abs(dual_residual[j]) > 1e-6) {
+      f_t ajty            = 0;
+      const i_t col_start = problem.A.col_start[j];
+      const i_t col_end   = problem.A.col_start[j + 1];
+      for (i_t p = col_start; p < col_end; ++p) {
+        const i_t i = problem.A.i[p];
+        ajty += problem.A.x[p] * y[i];
+        if (verbose) {
+          printf("y %d %s %e Aij %e\n", i, user_problem.row_names[i].c_str(), y[i], problem.A.x[p]);
+        }
+      }
+      if (verbose) {
+        printf("dual res %d %e aty %e z %e c %e \n",
+               j,
+               dual_residual[j],
+               ajty,
+               z[j],
+               problem.objective[j]);
+      }
+    }
+  }
+  const f_t dual_res_inf = vector_norm_inf<i_t, f_t>(dual_residual);
+  // TODO: fix me! In test ./cpp/build/tests/linear_programming/C_API_TEST
+  // c_api/TimeLimitTestFixture.time_limit/2 this is crashing. It is crashing only if it is run as
+  // whole in sequence and not filtering the respective test. Crash could be observed in previous
+  // versions by setting probing cache time to zero. assert(dual_res_inf < 1e-6);
+  return dual_res_inf;
+}
+
+template <typename i_t, typename f_t>
+static i_t user_col_to_problem_col(const user_problem_t<i_t, f_t>& user_problem,
+                                   const lp_problem_t<i_t, f_t>& problem,
+                                   i_t user_col)
+{
+  if (user_problem.second_order_cone_dims.empty()) { return user_col; }
+  if (problem.cone_var_start <= user_problem.cone_var_start) { return user_col; }
+  if (user_col < user_problem.cone_var_start) { return user_col; }
+  return problem.cone_var_start + (user_col - user_problem.cone_var_start);
+}
+
+template <typename i_t, typename f_t>
+void uncrush_primal_solution(const user_problem_t<i_t, f_t>& user_problem,
+                             const lp_problem_t<i_t, f_t>& problem,
+                             const std::vector<f_t>& solution,
+                             std::vector<f_t>& user_solution)
+{
+  user_solution.resize(user_problem.num_cols);
+  assert(problem.num_cols >= user_problem.num_cols);
+  assert(solution.size() >= user_problem.num_cols);
+  for (i_t j = 0; j < user_problem.num_cols; ++j) {
+    user_solution[j] = solution[user_col_to_problem_col(user_problem, problem, j)];
+  }
+}
+
+template <typename i_t, typename f_t>
+void uncrush_dual_solution(const user_problem_t<i_t, f_t>& user_problem,
+                           const lp_problem_t<i_t, f_t>& problem,
+                           const std::vector<f_t>& y,
+                           const std::vector<f_t>& z,
+                           std::vector<f_t>& user_y,
+                           std::vector<f_t>& user_z)
+{
+  user_y.resize(user_problem.num_rows);
+  // Reduced costs are uncrushed just like the primal solution
+  uncrush_primal_solution(user_problem, problem, z, user_z);
+
+  // Adjust the sign of the dual variables y
+  // We should have A^T y + z = c
+  // In convert_user_problem, we converted >= to <=, so we need to adjust the sign of the dual
+  // variables
+  for (i_t i = 0; i < user_problem.num_rows; i++) {
+    if (user_problem.row_sense[i] == 'G') {
+      user_y[i] = -y[i];
+    } else {
+      user_y[i] = y[i];
+    }
+  }
+}
+
+template <typename i_t, typename f_t>
+void uncrush_solution(const presolve_info_t<i_t, f_t>& presolve_info,
+                      const simplex_solver_settings_t<i_t, f_t>& settings,
+                      const lp_problem_t<i_t, f_t>& original_problem,
+                      const std::vector<f_t>& crushed_x,
+                      const std::vector<f_t>& crushed_y,
+                      const std::vector<f_t>& crushed_z,
+                      std::vector<f_t>& uncrushed_x,
+                      std::vector<f_t>& uncrushed_y,
+                      std::vector<f_t>& uncrushed_z)
+{
+  std::vector<f_t> input_x             = crushed_x;
+  std::vector<f_t> input_y             = crushed_y;
+  std::vector<f_t> input_z             = crushed_z;
+  std::vector<i_t> free_variable_pairs = presolve_info.free_variable_pairs;
+
+  // Free-variable substitution is the last presolve transformation, so undo it first.
+  if (!presolve_info.free_variable_eliminations.empty()) {
+    if (settings.postsolve_info == 1) {
+      settings.log.printf("Post-solve: Reconstructing %d eliminated free variables\n",
+                          static_cast<int>(presolve_info.free_variable_eliminations.size()));
+    }
+    assert(static_cast<i_t>(input_x.size()) ==
+           static_cast<i_t>(presolve_info.free_elimination_remaining_variables.size()));
+    assert(static_cast<i_t>(input_y.size()) ==
+           static_cast<i_t>(presolve_info.free_elimination_remaining_constraints.size()));
+    std::vector<f_t> expanded_x(presolve_info.free_elimination_num_variables, 0);
+    std::vector<f_t> expanded_z(presolve_info.free_elimination_num_variables, 0);
+    for (i_t k = 0; k < static_cast<i_t>(presolve_info.free_elimination_remaining_variables.size());
+         ++k) {
+      const i_t j   = presolve_info.free_elimination_remaining_variables[k];
+      expanded_x[j] = input_x[k];
+      expanded_z[j] = input_z[k];
+    }
+    input_x = std::move(expanded_x);
+    input_z = std::move(expanded_z);
+
+    std::vector<f_t> expanded_y(presolve_info.free_elimination_num_constraints, 0);
+    for (i_t k = 0;
+         k < static_cast<i_t>(presolve_info.free_elimination_remaining_constraints.size());
+         ++k) {
+      expanded_y[presolve_info.free_elimination_remaining_constraints[k]] = input_y[k];
+    }
+    input_y = std::move(expanded_y);
+
+    for (auto it = presolve_info.free_variable_eliminations.rbegin();
+         it != presolve_info.free_variable_eliminations.rend();
+         ++it) {
+      const auto& elimination = *it;
+      f_t value               = elimination.rhs;
+      for (size_t k = 0; k < elimination.columns.size(); ++k) {
+        value -= elimination.coefficients[k] * input_x[elimination.columns[k]];
+      }
+      input_x[elimination.variable] = value / elimination.pivot_coefficient;
+      input_z[elimination.variable] = 0;
+
+      if (elimination.pivot_row >= 0) {
+        f_t pivot_dual = 0;
+        for (size_t k = 0; k < elimination.affected_rows.size(); ++k) {
+          pivot_dual -= elimination.factors[k] * input_y[elimination.affected_rows[k]];
+        }
+        input_y[elimination.pivot_row] = pivot_dual;
+      }
+    }
+  }
+
+  if (presolve_info.folding_info.is_folded) {
+    // We solved a foled problem in the form
+    // minimize c_prime^T x_prime
+    // subject to A_prime x_prime = b_prime
+    // x_prime >= 0
+    //
+    // where A_prime = C^s A D
+    // and c_prime = D^T c
+    // and b_prime = C^s b
+
+    // We need to map this solution back to the converted problem
+    //
+    // minimize c^T x
+    // subject to A * x = b
+    //            x_j + w_j = u_j, j in U
+    //            0 <= x,
+    //            0 <= w
+
+    i_t reduced_cols  = presolve_info.folding_info.D.n;
+    i_t previous_cols = presolve_info.folding_info.D.m;
+    i_t reduced_rows  = presolve_info.folding_info.C_s.m;
+    i_t previous_rows = presolve_info.folding_info.C_s.n;
+
+    std::vector<f_t> xtilde(previous_cols);
+    std::vector<f_t> ytilde(previous_rows);
+    std::vector<f_t> ztilde(previous_cols);
+
+    matrix_vector_multiply(presolve_info.folding_info.D, 1.0, crushed_x, 0.0, xtilde);
+    matrix_transpose_vector_multiply(presolve_info.folding_info.C_s, 1.0, crushed_y, 0.0, ytilde);
+    matrix_transpose_vector_multiply(presolve_info.folding_info.D_s, 1.0, crushed_z, 0.0, ztilde);
+
+    settings.log.debug("|| y ||_2 = %e\n", vector_norm2<i_t, f_t>(ytilde));
+    settings.log.debug("|| z ||_2 = %e\n", vector_norm2<i_t, f_t>(ztilde));
+    std::vector<f_t> dual_residual(previous_cols);
+    for (i_t j = 0; j < previous_cols; j++) {
+      dual_residual[j] = ztilde[j] - presolve_info.folding_info.c_tilde[j];
+    }
+    matrix_transpose_vector_multiply(
+      presolve_info.folding_info.A_tilde, 1.0, ytilde, 1.0, dual_residual);
+    if (settings.postsolve_info == 1) {
+      settings.log.printf("Unfolded dual residual = %e\n",
+                          vector_norm_inf<i_t, f_t>(dual_residual));
+    }
+
+    // Now we need to map the solution back to the original problem
+    // minimize c^T x
+    // subject to A * x = b
+    //           0 <= x,
+    //           x_j <= u_j, j in U
+    input_x = xtilde;
+    input_x.resize(previous_cols - presolve_info.folding_info.num_upper_bounds);
+    input_y = ytilde;
+    input_y.resize(previous_rows - presolve_info.folding_info.num_upper_bounds);
+    input_z = ztilde;
+    input_z.resize(previous_cols - presolve_info.folding_info.num_upper_bounds);
+
+    // If the original problem had free variables we need to reinstate them
+    free_variable_pairs = presolve_info.folding_info.previous_free_variable_pairs;
+  }
+
+  const i_t num_free_variables = free_variable_pairs.size() / 2;
+  if (num_free_variables > 0) {
+    if (settings.postsolve_info == 1) {
+      settings.log.printf("Post-solve: Handling free variables %d\n", num_free_variables);
+    }
+    // We added free variables so we need to map the crushed solution back to the original variables
+    for (i_t k = 0; k < 2 * num_free_variables; k += 2) {
+      const i_t u = free_variable_pairs[k];
+      const i_t v = free_variable_pairs[k + 1];
+      input_x[u] -= input_x[v];
+    }
+    input_z.resize(input_z.size() - num_free_variables);
+    input_x.resize(input_x.size() - num_free_variables);
+  }
+
+  if (presolve_info.removed_variables.size() > 0) {
+    if (settings.postsolve_info == 1) {
+      settings.log.printf("Post-solve: Handling removed variables %d\n",
+                          presolve_info.removed_variables.size());
+    }
+    // We removed some variables, so we need to map the crushed solution back to the original
+    // variables
+    const i_t n = presolve_info.removed_variables.size() + presolve_info.remaining_variables.size();
+    std::vector<f_t> input_x_copy = input_x;
+    std::vector<f_t> input_z_copy = input_z;
+    input_x_copy.resize(n);
+    input_z_copy.resize(n);
+
+    i_t k = 0;
+    for (const i_t j : presolve_info.remaining_variables) {
+      input_x_copy[j] = input_x[k];
+      input_z_copy[j] = input_z[k];
+      k++;
+    }
+
+    k = 0;
+    for (const i_t j : presolve_info.removed_variables) {
+      input_x_copy[j] = presolve_info.removed_values[k];
+      input_z_copy[j] = presolve_info.removed_reduced_costs[k];
+      k++;
+    }
+    input_x = input_x_copy;
+    input_z = input_z_copy;
+  }
+
+  if (presolve_info.removed_constraints.size() > 0) {
+    if (settings.postsolve_info == 1) {
+      settings.log.printf("Post-solve: Handling removed constraints %d\n",
+                          presolve_info.removed_constraints.size());
+    }
+    // We removed some constraints, so we need to map the crushed solution back to the original
+    // constraints
+    const i_t m =
+      presolve_info.removed_constraints.size() + presolve_info.remaining_constraints.size();
+    std::vector<f_t> input_y_copy = input_y;
+    input_y_copy.resize(m);
+
+    i_t k = 0;
+    for (const i_t i : presolve_info.remaining_constraints) {
+      input_y_copy[i] = input_y[k];
+      k++;
+    }
+    for (const i_t i : presolve_info.removed_constraints) {
+      input_y_copy[i] = 0.0;
+    }
+    input_y = input_y_copy;
+  }
+
+  if (presolve_info.removed_lower_bounds.size() > 0) {
+    i_t num_lower_bounds = 0;
+
+    // We removed some lower bounds so we need to map the crushed solution back to the original
+    // variables
+    for (i_t j = 0; j < input_x.size(); j++) {
+      if (presolve_info.removed_lower_bounds[j] != 0.0) { num_lower_bounds++; }
+      input_x[j] += presolve_info.removed_lower_bounds[j];
+    }
+    if (settings.postsolve_info == 1) {
+      settings.log.printf("Post-solve: Handling removed lower bounds %d\n", num_lower_bounds);
+    }
+  }
+
+  if (presolve_info.negated_variables.size() > 0) {
+    for (const i_t j : presolve_info.negated_variables) {
+      input_x[j] *= -1.0;
+      input_z[j] *= -1.0;
+    }
+  }
+
+  // Dual correction for originally free variables that received implied bounds.
+  // Barrier produced (y, z) with z_j != 0 satisfying A^T y + z = c + Qx.
+  // We need corrected (y_bar, z_bar) with z_bar_j = 0 for all j in F_b where
+  // F_b = { j | x_j was initially free and is now bounded }
+  //
+  // For a given j_f in F_b, let i* be the constraint that implied the bound on x_j_f.
+  // Compute the scalar delta_u = z_j_f / a_{i*,j_f}.
+  // Set y_bar = y + delta_u e_i* and
+  // Let R_i* = { j | a_{i*, j} != 0 }
+  // z_bar_j = z_j - delta_u a_{i*,j} for all j in R_i*.
+  // z_bar_j = z_j                    for all j not in R_i*.
+  //
+  // Then you can show that A^T y_bar + z_bar = c + Qx and
+  // z_bar_{j_f} = 0.
+  if (!presolve_info.bounded_free_variables.empty()) {
+    const i_t num_bfv = static_cast<i_t>(presolve_info.bounded_free_variables.size());
+    if (settings.postsolve_info == 1) {
+      settings.log.printf("Post-solve: Correcting duals for %d bounded free variables\n", num_bfv);
+    }
+    const csc_matrix_t<i_t, f_t>& A = original_problem.A;
+
+    // Traverse in reverse order, to ensure that all z_j = 0 after the correction
+    csr_matrix_t<i_t, f_t> Arow(0, 0, 0);
+    A.to_compressed_row(Arow);
+    for (auto it = presolve_info.bounded_free_variables.rbegin();
+         it != presolve_info.bounded_free_variables.rend();
+         ++it) {
+      const auto& bfv = *it;
+      const f_t w_j   = input_z[bfv.variable];
+      if (w_j == 0.0) { continue; }
+      const f_t du = w_j / bfv.coefficient;
+      input_y[bfv.constraint] += du;
+      const i_t row_start = Arow.row_start[bfv.constraint];
+      const i_t row_end   = Arow.row_start[bfv.constraint + 1];
+      for (i_t p = row_start; p < row_end; ++p) {
+        input_z[Arow.j[p]] -= Arow.x[p] * du;
+      }
+    }
+  }
+
+  assert(uncrushed_x.size() == input_x.size());
+  assert(uncrushed_y.size() == input_y.size());
+  assert(uncrushed_z.size() == input_z.size());
+
+  uncrushed_x = input_x;
+  uncrushed_y = input_y;
+  uncrushed_z = input_z;
+}
+
+#ifdef DUAL_SIMPLEX_INSTANTIATE_DOUBLE
+
+template void convert_user_problem<int, double>(
+  const user_problem_t<int, double>& user_problem,
+  const simplex_solver_settings_t<int, double>& settings,
+  lp_problem_t<int, double>& problem,
+  std::vector<int>& new_slacks,
+  dualize_info_t<int, double>& dualize_info);
+
+template void convert_lp_to_user_problem<int, double>(
+  const lp_problem_t<int, double>& simplex_problem,
+  const std::vector<variable_type_t>& var_types,
+  const simplex_solver_settings_t<int, double>& settings,
+  user_problem_t<int, double>& user_problem);
+
+template void convert_user_lp_with_guess<int, double>(
+  const user_problem_t<int, double>& user_problem,
+  const lp_solution_t<int, double>& initial_solution,
+  const std::vector<double>& initial_slack,
+  lp_problem_t<int, double>& lp,
+  lp_solution_t<int, double>& converted_solution);
+
+template int presolve<int, double>(const lp_problem_t<int, double>& original,
+                                   const simplex_solver_settings_t<int, double>& settings,
+                                   lp_problem_t<int, double>& presolved,
+                                   presolve_info_t<int, double>& presolve_info);
+
+template void crush_primal_solution<int, double>(const user_problem_t<int, double>& user_problem,
+                                                 const lp_problem_t<int, double>& problem,
+                                                 const std::vector<double>& user_solution,
+                                                 const std::vector<int>& new_slacks,
+                                                 std::vector<double>& solution);
+
+template double crush_dual_solution<int, double>(const user_problem_t<int, double>& user_problem,
+                                                 const lp_problem_t<int, double>& problem,
+                                                 const std::vector<int>& new_slacks,
+                                                 const std::vector<double>& user_y,
+                                                 const std::vector<double>& user_z,
+                                                 std::vector<double>& y,
+                                                 std::vector<double>& z);
+
+template void uncrush_primal_solution<int, double>(const user_problem_t<int, double>& user_problem,
+                                                   const lp_problem_t<int, double>& problem,
+                                                   const std::vector<double>& solution,
+                                                   std::vector<double>& user_solution);
+
+template void uncrush_dual_solution<int, double>(const user_problem_t<int, double>& user_problem,
+                                                 const lp_problem_t<int, double>& problem,
+                                                 const std::vector<double>& y,
+                                                 const std::vector<double>& z,
+                                                 std::vector<double>& user_y,
+                                                 std::vector<double>& user_z);
+
+template void uncrush_solution<int, double>(const presolve_info_t<int, double>& presolve_info,
+                                            const simplex_solver_settings_t<int, double>& settings,
+                                            const lp_problem_t<int, double>& original_problem,
+                                            const std::vector<double>& crushed_x,
+                                            const std::vector<double>& crushed_y,
+                                            const std::vector<double>& crushed_z,
+                                            std::vector<double>& uncrushed_x,
+                                            std::vector<double>& uncrushed_y,
+                                            std::vector<double>& uncrushed_z);
+
+template row_bounds_t<double> get_range_bounds_from_sense<double>(char, double, double);
+
+#endif
+
+// Emitted unconditionally: third_party_presolve.cpp always instantiates its <int, float>
+// variant (its guard MIP_INSTANTIATE_FLOAT || PDLP_INSTANTIATE_FLOAT is always true because
+// PDLP_INSTANTIATE_FLOAT == 1), so this float symbol must exist even though the rest of this
+// dual_simplex TU is double-only.
+template row_bounds_t<float> get_range_bounds_from_sense<float>(char, float, float);
+
+}  // namespace cuopt::mathematical_optimization::simplex

@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import os
+
+from cuopt_server.utils.linear_programming.conversion import (
+    create_data_model as lp_create_data_model,
+    create_solver as lp_create_solver,
+)
+from cuopt_server.utils.routing.conversion import (
+    create_data_model as routing_create_data_model,
+    create_solver as routing_create_solver,
+    populate_optimization_data,
+    prep_optimization_data as routing_prep_optimization_data,
+)
+from cuopt_server.utils.linear_programming.data_definition import LPData
+from cuopt_server.utils.linear_programming.data_transformation import (
+    transform_lp_data,
+)
+from cuopt_server.utils.routing.data_definition import OptimizedRoutingData
+
+
+def build_routing_datamodel_from_json(data):
+    """
+    data: A valid dictionary or a json file-path with
+          valid format as per open-api spec.
+    """
+
+    if isinstance(data, dict):
+        data = dict(OptimizedRoutingData.parse_obj(data))
+    elif os.path.isfile(data):
+        with open(data, "r") as f:
+            data = dict(OptimizedRoutingData.parse_obj(json.loads(f.read())))
+    else:
+        raise ValueError(
+            f"Invalid type : {type(data)} has been provided as input, "
+            "requires json input"
+        )
+
+    optimization_data = populate_optimization_data(**data)
+    (
+        optimization_data,
+        cost_matrix,
+        travel_time_matrix,
+        _,
+    ) = routing_prep_optimization_data(optimization_data)
+    _, data_model = routing_create_data_model(
+        optimization_data,
+        cost_matrix=cost_matrix,
+        travel_time_matrix=travel_time_matrix,
+    )
+
+    _, solver_settings = routing_create_solver(optimization_data)
+
+    return data_model, solver_settings
+
+
+def build_lp_datamodel_from_json(data):
+    """
+    data: A valid dictionary or a json file-path with
+          valid format as per open-api spec.
+    """
+
+    if isinstance(data, dict):
+        data = LPData.parse_obj(data)
+    elif os.path.isfile(data):
+        with open(data, "r") as f:
+            data = json.loads(f.read())
+            # Remove this once we support variable names
+            data.pop("variable_names")
+            data = LPData.parse_obj(data)
+    else:
+        raise ValueError(
+            f"Invalid type : {type(data)} has been provided as input, "
+            "requires json input"
+        )
+
+    # transform data into digestible format
+    transform_lp_data(data)
+
+    _, data_model = lp_create_data_model(data)
+    _, solver_settings = lp_create_solver(data, None)
+
+    return data_model, solver_settings

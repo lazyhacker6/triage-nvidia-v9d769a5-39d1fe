@@ -1,0 +1,591 @@
+/* clang-format off */
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/* clang-format on */
+
+#include <cuopt/error.hpp>
+#include <cuopt/mathematical_optimization/backend_selection.hpp>
+#include <cuopt/mathematical_optimization/cpu_optimization_problem.hpp>
+#include <cuopt/mathematical_optimization/io/parser.hpp>
+#include <cuopt/mathematical_optimization/mip/solver_settings.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem_utils.hpp>
+#include <cuopt/mathematical_optimization/solve.hpp>
+#include <cuopt/mathematical_optimization/solve_remote.hpp>
+#include <utilities/logger.hpp>
+#include <utilities/timer.hpp>
+
+#include <raft/core/device_setter.hpp>
+#include <raft/core/handle.hpp>
+
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+
+#include <unistd.h>
+#include <argparse/argparse.hpp>
+#include <cstdint>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <variant>
+#include <vector>
+
+#include <math_optimization/solution_reader.hpp>
+
+#include <cuopt/version_config.hpp>
+
+static char cuda_module_loading_env[] = "CUDA_MODULE_LOADING=EAGER";
+
+/**
+ * @file cuopt_cli.cpp
+ * @brief Command line interface for solving Linear Programming (LP) and Mixed Integer Programming
+ * (MIP) problems using cuOpt
+ *
+ * This CLI provides a simple interface to solve LP/MIP problems using cuOpt. It accepts MPS, QPS,
+ * or LP format input files (dispatched automatically by extension; see run_single_file below for
+ * the full list of supported suffixes) and various solver parameters.
+ *
+ * Usage:
+ * ```
+ * cuopt_cli <input_file_path> [OPTIONS]
+ * cuopt_cli [OPTIONS] <input_file_path>
+ * ```
+ *
+ * Required arguments:
+ * - <input_file_path>: Path to the MPS or LP format input file containing the optimization problem
+ *
+ * Optional arguments:
+ * - --initial-solution: Path to initial solution file in SOL format
+ * - Various solver parameters that can be passed as command line arguments
+ *   (e.g. --max-iterations, --tolerance, etc.)
+ *
+ * Example:
+ * ```
+ * cuopt_cli problem.mps --max-iterations 1000
+ * ```
+ *
+ * The solver will read the MPS file, solve the optimization problem according to the specified
+ * parameters, and write the solution to a .sol file in the output directory.
+ */
+
+/**
+ * @brief Make an async memory resource for RMM
+ * @return std::shared_ptr<rmm::mr::cuda_async_memory_resource>
+ */
+inline auto make_async() { return std::make_shared<rmm::mr::cuda_async_memory_resource>(); }
+
+/**
+ * @brief Handle logger when error happens before logger is initialized
+ * @param settings Solver settings
+ * @return cuopt::init_logger_t
+ */
+inline cuopt::init_logger_t dummy_logger(
+  const cuopt::mathematical_optimization::solver_settings_t<int, double>& settings)
+{
+  return cuopt::init_logger_t(settings.template get_parameter<std::string>(CUOPT_LOG_FILE),
+                              settings.template get_parameter<bool>(CUOPT_LOG_TO_CONSOLE));
+}
+
+/**
+ * @brief A parsed problem held with either 32-bit or 64-bit matrix indices.
+ *
+ * The 64-bit alternative exists for problems whose nonzero count exceeds INT_MAX.
+ * Only multi-GPU PDLP can solve those (it partitions the matrix into per-GPU
+ * sub-problems that are individually 32-bit), so every other code path in this
+ * CLI works exclusively with the 32-bit alternative.
+ */
+using problem_variant_t =
+  std::variant<cuopt::mathematical_optimization::io::mps_data_model_t<int, double>,
+               cuopt::mathematical_optimization::io::mps_data_model_t<int64_t, double>>;
+
+/**
+ * @brief Parse the input file into the requested index width.
+ * @param file_path Path to the input file; the format is dispatched by extension.
+ * @param mps_reader MPS reader implementation selected by the CLI
+ * @param index_64bit If true, parse into a 64-bit index model
+ */
+problem_variant_t read_problem(const std::string& file_path,
+                               cuopt::mathematical_optimization::io::mps_reader_type_t mps_reader,
+                               bool index_64bit)
+{
+  namespace io = cuopt::mathematical_optimization::io;
+  if (index_64bit) { return io::read<int64_t, double>(file_path, mps_reader); }
+  return io::read<int, double>(file_path, mps_reader);
+}
+
+/**
+ * @brief Run a single file
+ * @param file_path Path to the input file. Dispatched by extension:
+ *                  .lp/.lp.gz/.lp.bz2 → LP parser;
+ *                  .mps/.qps and their .gz/.bz2 variants → MPS parser;
+ *                  anything else is rejected.
+ * @param initial_solution_file Path to initial solution file in SOL format
+ * @param mps_reader MPS reader implementation selected by the CLI
+ * @param settings Merged solver settings (config file loaded in main, then CLI overrides applied)
+ */
+int run_single_file(const std::string& file_path,
+                    const std::string& initial_solution_file,
+                    bool solve_relaxation,
+                    cuopt::mathematical_optimization::io::mps_reader_type_t mps_reader,
+                    cuopt::mathematical_optimization::solver_settings_t<int, double>& settings,
+                    bool index_64bit = false)
+{
+  // The CLI and the solver library have separate loggers that both write this file.
+  // Configure the solver's first so its own initializer reuses that configuration rather
+  // than truncating the file mid-solve; the CLI's own logger then appends to it.
+  const auto log_file    = settings.get_parameter<std::string>(CUOPT_LOG_FILE);
+  const auto log_console = settings.get_parameter<bool>(CUOPT_LOG_TO_CONSOLE);
+
+  auto solver_log =
+    cuopt::mathematical_optimization::configure_logging(log_file, log_console, true);
+  cuopt::init_logger_t log(log_file, log_console, /*truncate=*/false);
+
+  std::string base_filename = file_path.substr(file_path.find_last_of("/\\") + 1);
+
+  problem_variant_t problem;
+  bool parsing_failed = false;
+  auto timer          = cuopt::timer_t(settings.get_parameter<double>(CUOPT_TIME_LIMIT));
+  {
+    CUOPT_LOG_INFO("Reading file %s", base_filename.c_str());
+    try {
+      problem = read_problem(file_path, mps_reader, index_64bit);
+    } catch (const std::logic_error& e) {
+      CUOPT_LOG_ERROR("Parser exception: %s", e.what());
+      parsing_failed = true;
+    }
+  }
+  if (parsing_failed) {
+    auto log = dummy_logger(settings);
+    CUOPT_LOG_ERROR("Parsing input file failed. Exiting!");
+    return -1;
+  }
+  CUOPT_LOG_INFO("Read file %s in %.2f seconds", base_filename.c_str(), timer.elapsed_time());
+
+  // Determine memory backend and create problem using interface
+  // Create handle only for GPU memory backend (avoid CUDA init on CPU-only hosts)
+  auto memory_backend = cuopt::mathematical_optimization::get_memory_backend_type();
+  std::unique_ptr<raft::handle_t> handle_ptr;
+  std::unique_ptr<cuopt::mathematical_optimization::optimization_problem_interface_t<int, double>>
+    problem_interface;
+
+  if (memory_backend == cuopt::mathematical_optimization::memory_backend_t::GPU) {
+    handle_ptr = std::make_unique<raft::handle_t>();
+    problem_interface =
+      std::make_unique<cuopt::mathematical_optimization::optimization_problem_t<int, double>>(
+        handle_ptr.get());
+  } else {
+    problem_interface =
+      std::make_unique<cuopt::mathematical_optimization::cpu_optimization_problem_t<int, double>>();
+  }
+
+  // Multi-GPU PDLP is used for large problems that don't fit on a single GPU.
+  // We need to debranch before the problem_interface is created and tries to materialize the
+  // problem in device memory.
+  const auto& pdlp_settings_ref = settings.get_pdlp_settings();
+  if (pdlp_settings_ref.method == cuopt::mathematical_optimization::method_t::PDLP &&
+      (pdlp_settings_ref.num_gpus == -1 || pdlp_settings_ref.num_gpus > 1)) {
+    if (handle_ptr == nullptr) {
+      CUOPT_LOG_ERROR(
+        "Multi-GPU PDLP requires the GPU memory backend; no GPU handle is available for the "
+        "selected memory backend.");
+      return -1;
+    }
+    if (!initial_solution_file.empty()) {
+      CUOPT_LOG_ERROR("Initial solution file is not supported for multi-GPU PDLP.");
+      return -1;
+    }
+    auto sol = std::visit(
+      [&](auto const& mps) {
+        return cuopt::mathematical_optimization::solve_lp(
+          handle_ptr.get(), mps, settings.get_pdlp_settings());
+      },
+      problem);
+    if (sol.get_error_status().get_error_type() != cuopt::error_type_t::Success) {
+      CUOPT_LOG_ERROR("Multi-GPU PDLP failed: %s", sol.get_error_status().what());
+      return -1;
+    }
+    return 0;
+  }
+  // Only the 32-bit model is wired into the solver; the 64-bit one stops here for now.
+  if (std::holds_alternative<
+        cuopt::mathematical_optimization::io::mps_data_model_t<int64_t, double>>(problem)) {
+    CUOPT_LOG_ERROR(
+      "64-bit index is only supported for multi-GPU PDLP, set it using --num-gpus and --method 1.");
+    return -1;
+  }
+  auto& mps_data_model =
+    std::get<cuopt::mathematical_optimization::io::mps_data_model_t<int, double>>(problem);
+  cuopt::mathematical_optimization::adopt_from_mps_data_model(problem_interface.get(),
+                                                              std::move(mps_data_model));
+
+  const bool is_mip = (problem_interface->get_problem_category() ==
+                         cuopt::mathematical_optimization::problem_category_t::MIP ||
+                       problem_interface->get_problem_category() ==
+                         cuopt::mathematical_optimization::problem_category_t::IP) &&
+                      !solve_relaxation;
+
+  try {
+    auto initial_solution =
+      initial_solution_file.empty()
+        ? std::vector<double>()
+        : cuopt::mathematical_optimization::solution_reader_t::get_variable_values_from_sol_file(
+            initial_solution_file, problem_interface->get_variable_names());
+
+    if (is_mip) {
+      auto& mip_settings = settings.get_mip_settings();
+      if (initial_solution.size() > 0) {
+        mip_settings.add_initial_solution(initial_solution.data(), initial_solution.size());
+      }
+    } else {
+      auto& lp_settings = settings.get_pdlp_settings();
+      if (initial_solution.size() > 0) {
+        lp_settings.set_initial_primal_solution(initial_solution.data(), initial_solution.size());
+      }
+    }
+  } catch (const std::exception& e) {
+    auto log = dummy_logger(settings);
+    CUOPT_LOG_ERROR("Error: %s", e.what());
+    return -1;
+  }
+
+  try {
+    if (cuopt::mathematical_optimization::is_remote_execution_enabled()) {
+      // Remote execution: problem_interface holds a cpu_optimization_problem_t.
+      // solve_lp/mip_remote live in cuopt_client, which this binary already links.
+      auto* cpu_prob =
+        dynamic_cast<cuopt::mathematical_optimization::cpu_optimization_problem_t<int, double>*>(
+          problem_interface.get());
+      if (cpu_prob == nullptr) {
+        CUOPT_LOG_ERROR("Remote execution requires the CPU memory backend.");
+        return -1;
+      }
+#ifdef CUOPT_ENABLE_GRPC
+      if (is_mip) {
+        auto solution = cuopt::mathematical_optimization::solve_mip_remote(*cpu_prob, settings);
+      } else {
+        auto solution = cuopt::mathematical_optimization::solve_lp_remote(*cpu_prob, settings);
+      }
+#else
+      // solve_remote.cpp only builds when gRPC is enabled, so these entry points do not
+      // exist in a SKIP_GRPC_BUILD tree. cuopt_cli is still built there (it is gated on
+      // BUILD_LP_ONLY, not on gRPC), so without this the link fails.
+      CUOPT_LOG_ERROR("Remote execution requires cuOpt built with gRPC support.");
+      return -1;
+#endif
+    } else if (is_mip) {
+      auto solution =
+        cuopt::mathematical_optimization::solve_mip(problem_interface.get(), settings);
+    } else {
+      // Multi-GPU PDLP was handled by the early-exit branch above; this
+      // path is always single-GPU LP going through problem_interface.
+      auto solution = cuopt::mathematical_optimization::solve_lp(problem_interface.get(), settings);
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "cuopt_cli error: %s\n", e.what());
+    CUOPT_LOG_ERROR("Error: %s", e.what());
+    return -1;
+  }
+
+  return 0;
+}
+
+/**
+ * @brief Convert a parameter name to an argument name
+ * @param input Parameter name
+ * @return Argument name
+ */
+std::string param_name_to_arg_name(const std::string& input)
+{
+  std::string result = "--";
+  result += input;
+
+  // Replace underscores with hyphens
+  std::replace(result.begin(), result.end(), '_', '-');
+
+  return result;
+}
+
+/**
+ * @brief Set the CUDA module loading environment variable
+ * If the method is 0, set the CUDA module loading environment variable to EAGER
+ * This needs to be done before the first call to the CUDA API. In this file before dummy settings
+ * default constructor is called.
+ * @param argc Number of command line arguments
+ * @param argv Command line arguments
+ * @return 0 on success, 1 on failure
+ */
+int set_cuda_module_loading(int argc, char* argv[])
+{
+  // Parse method_int from argv
+  int method_int = 0;  // Default value
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if ((arg == "--method" || arg == "-m") && i + 1 < argc) {
+      try {
+        method_int = std::stoi(argv[i + 1]);
+      } catch (...) {
+        std::cerr << "Invalid value for --method: " << argv[i + 1] << std::endl;
+        return 1;
+      }
+      break;
+    }
+    // Also support --method=1 style
+    if (arg.rfind("--method=", 0) == 0) {
+      try {
+        method_int = std::stoi(arg.substr(9));
+      } catch (...) {
+        std::cerr << "Invalid value for --method: " << arg << std::endl;
+        return 1;
+      }
+      break;
+    }
+  }
+
+  char* env_val = getenv("CUDA_MODULE_LOADING");
+  if (method_int == 0 && (!env_val || env_val[0] == '\0')) {
+    CUOPT_LOG_INFO("Setting CUDA_MODULE_LOADING to EAGER");
+    putenv(cuda_module_loading_env);
+  }
+  return 0;
+}
+
+/**
+ * @brief Main function for the cuOpt CLI
+ * @param argc Number of command line arguments
+ * @param argv Command line arguments
+ * @return 0 on success, 1 on failure
+ */
+int main(int argc, char* argv[])
+{
+  // Handle dump flags before argparse so no other args are required
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--dump-hyper-params") {
+      cuopt::mathematical_optimization::solver_settings_t<int, double> settings;
+      settings.dump_parameters_to_file("/dev/stdout", true);
+      return 0;
+    }
+    if (arg == "--dump-params") {
+      cuopt::mathematical_optimization::solver_settings_t<int, double> settings;
+      settings.dump_parameters_to_file("/dev/stdout", false);
+      return 0;
+    }
+  }
+
+  if (set_cuda_module_loading(argc, argv) != 0) { return 1; }
+
+  // Get the version string from the version_config.hpp file
+  const std::string version_string = std::string("cuOpt ") + std::to_string(CUOPT_VERSION_MAJOR) +
+                                     "." + std::to_string(CUOPT_VERSION_MINOR) + "." +
+                                     std::to_string(CUOPT_VERSION_PATCH);
+
+  // Create the argument parser
+  argparse::ArgumentParser program("cuopt_cli", version_string);
+
+  // Define all arguments with appropriate defaults and help messages
+  program.add_argument("filename")
+    .help(
+      "input problem file; format dispatched by extension (case-insensitive). "
+      "Supported: .lp, .mps, .qps and their .gz / .bz2 / .lz4 compressed variants "
+      "(e.g. .lp.gz, .mps.bz2, .qps.lz4).")
+    .nargs(1)
+    .required();
+
+  // FIXME: use a standard format for initial solution file
+  program.add_argument("--initial-solution")
+    .help("path to the initial solution .sol file")
+    .default_value("");
+
+  program.add_argument("--relaxation")
+    .help("solve the LP relaxation of the MIP")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--params-file")
+    .help("path to parameter config file (key = value format, supports all parameters)")
+    .default_value(std::string(""));
+
+  program.add_argument("--mps-reader")
+    .help(
+      "MPS reader implementation: default uses the production parser; experimental-fast uses the "
+      "experimental SIMD parser for free-format LP/MIP/QP/QCQP (SOCP) .mps/.qps files and their "
+      ".gz/.bz2/.lz4 compressed variants")
+    .default_value(std::string("default"))
+    .choices("default", "experimental-fast");
+
+  program.add_argument("--mps-index-64bit")
+    .help(
+      "parse the input MPS/LP file into a 64-bit index model (required when the nonzero "
+      "count exceeds INT_MAX; only usable with --presolve 0, --method 1 and --num-gpus >1 or -1)")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--dump-hyper-params")
+    .help("print hyper-parameters only in config file format and exit")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--dump-params")
+    .help("print all parameters in config file format and exit")
+    .default_value(false)
+    .implicit_value(true);
+
+  std::map<std::string, std::string> arg_name_to_param_name;
+
+  // Register --pdlp-precision with string-to-int mapping so that it flows
+  // through the settings_strings map like other settings.
+  program.add_argument("--pdlp-precision")
+    .help(
+      "PDLP precision mode. default: native type, single: FP32 internally, "
+      "double: FP64 explicitly, mixed: mixed-precision SpMV (FP32 matrix, FP64 vectors).")
+    .default_value(std::string("-1"))
+    .choices("default", "single", "double", "mixed", "-1", "0", "1", "2");
+  arg_name_to_param_name["--pdlp-precision"] = CUOPT_PDLP_PRECISION;
+
+  {
+    // Add all solver settings as arguments
+    cuopt::mathematical_optimization::solver_settings_t<int, double> dummy_settings;
+
+    auto int_params    = dummy_settings.get_int_parameters();
+    auto double_params = dummy_settings.get_float_parameters();
+    auto bool_params   = dummy_settings.get_bool_parameters();
+    auto string_params = dummy_settings.get_string_parameters();
+
+    for (auto& param : int_params) {
+      std::string arg_name = param_name_to_arg_name(param.param_name);
+      // handle duplicate parameters appearing in MIP and LP settings
+      if (arg_name_to_param_name.count(arg_name) == 0) {
+        auto& arg = program.add_argument(arg_name.c_str()).default_value(param.default_value);
+        if (param.param_name.find("hyper_") != std::string::npos) { arg.hidden(); }
+        arg_name_to_param_name[arg_name] = param.param_name;
+      }
+    }
+
+    for (auto& param : double_params) {
+      std::string arg_name = param_name_to_arg_name(param.param_name);
+      if (arg_name_to_param_name.count(arg_name) == 0) {
+        auto& arg = program.add_argument(arg_name.c_str()).default_value(param.default_value);
+        if (param.param_name.find("hyper_") != std::string::npos) { arg.hidden(); }
+        arg_name_to_param_name[arg_name] = param.param_name;
+      }
+    }
+
+    for (auto& param : bool_params) {
+      std::string arg_name = param_name_to_arg_name(param.param_name);
+      if (arg_name_to_param_name.count(arg_name) == 0) {
+        auto& arg = program.add_argument(arg_name.c_str()).default_value(param.default_value);
+        if (param.param_name.find("hyper_") != std::string::npos) { arg.hidden(); }
+        arg_name_to_param_name[arg_name] = param.param_name;
+      }
+    }
+
+    for (auto& param : string_params) {
+      std::string arg_name = param_name_to_arg_name(param.param_name);
+      if (arg_name_to_param_name.count(arg_name) == 0) {
+        auto& arg = program.add_argument(arg_name.c_str()).default_value(param.default_value);
+        if (param.param_name.find("hyper_") != std::string::npos) { arg.hidden(); }
+        arg_name_to_param_name[arg_name] = param.param_name;
+      }
+    }
+  }  // done with solver settings
+
+  // Parse arguments
+  try {
+    program.parse_args(argc, argv);
+  } catch (const std::runtime_error& err) {
+    std::cerr << err.what() << std::endl;
+    std::cerr << program;
+    return 1;
+  }
+
+  // Map symbolic pdlp-precision names to integer values
+  static const std::map<std::string, std::string> precision_name_to_value = {
+    {"default", "-1"}, {"single", "0"}, {"double", "1"}, {"mixed", "2"}};
+
+  // Read everything as a string
+  std::map<std::string, std::string> settings_strings;
+  for (auto& [arg_name, param_name] : arg_name_to_param_name) {
+    if (program.is_used(arg_name.c_str())) {
+      auto val = program.get<std::string>(arg_name.c_str());
+      if (param_name == CUOPT_PDLP_PRECISION) {
+        auto it = precision_name_to_value.find(val);
+        if (it != precision_name_to_value.end()) { val = it->second; }
+      }
+      settings_strings[param_name] = val;
+    }
+  }
+  // Get the values
+  std::string file_name = program.get<std::string>("filename");
+
+  const auto initial_solution_file = program.get<std::string>("--initial-solution");
+  const auto solve_relaxation      = program.get<bool>("--relaxation");
+  const auto params_file           = program.get<std::string>("--params-file");
+  const auto mps_reader_arg        = program.get<std::string>("--mps-reader");
+  const auto index_64bit           = program.get<bool>("--mps-index-64bit");
+
+  auto mps_reader = cuopt::mathematical_optimization::io::mps_reader_type_t::default_reader;
+  if (mps_reader_arg == "experimental-fast") {
+    mps_reader = cuopt::mathematical_optimization::io::mps_reader_type_t::fast_experimental;
+  }
+
+  cuopt::mathematical_optimization::solver_settings_t<int, double> settings;
+  try {
+    if (!params_file.empty()) { settings.load_parameters_from_file(params_file); }
+    for (auto& [key, val] : settings_strings) {
+      settings.set_parameter_from_string(key, val);
+      CUOPT_LOG_INFO("Setting parameter %s to %s", key.c_str(), val.c_str());
+    }
+  } catch (const std::exception& e) {
+    auto log = dummy_logger(settings);
+    CUOPT_LOG_ERROR("Error: %s", e.what());
+    return -1;
+  }
+
+  // --method 1 --num-gpus N (N>1 or -1 for all visible GPUs) selects multi-GPU PDLP.
+  // Default / concurrent requires 1–2 GPUs.
+  {
+    auto& pdlp_settings = settings.get_pdlp_settings();
+    const int num_gpus  = pdlp_settings.num_gpus;
+    const bool is_mpdlp =
+      pdlp_settings.method == cuopt::mathematical_optimization::method_t::PDLP &&
+      (num_gpus == -1 || num_gpus > 1);
+    if (!is_mpdlp && (num_gpus < 1 || num_gpus > 2)) {
+      auto log = dummy_logger(settings);
+      CUOPT_LOG_ERROR(
+        "num_gpus=%d is only supported with --method 1 (multi-GPU PDLP, where -1 selects "
+        "all visible GPUs). Concurrent / default mode requires 1 or 2 GPUs.",
+        num_gpus);
+      return -1;
+    }
+  }
+
+  // Only initialize CUDA resources if using GPU memory backend (not remote execution)
+  auto memory_backend = cuopt::mathematical_optimization::get_memory_backend_type();
+  std::vector<rmm::mr::cuda_async_memory_resource> memory_resources;
+
+  if (memory_backend == cuopt::mathematical_optimization::memory_backend_t::GPU) {
+    int device_count   = raft::device_setter::get_device_count();
+    int requested_gpus = settings.get_parameter<int>(CUOPT_NUM_GPUS);
+    if (requested_gpus == -1) {
+      requested_gpus                        = device_count;
+      settings.get_pdlp_settings().num_gpus = requested_gpus;
+    }
+    if (requested_gpus > device_count) {
+      auto log = dummy_logger(settings);
+      CUOPT_LOG_ERROR("num-gpus=%d exceeds the number of visible CUDA devices: %d. Aborting solve.",
+                      requested_gpus,
+                      device_count);
+      return -1;
+    }
+    memory_resources.reserve(requested_gpus);
+    for (int i = 0; i < requested_gpus; ++i) {
+      raft::device_setter guard(i);
+      memory_resources.emplace_back();
+      rmm::mr::set_per_device_resource(rmm::cuda_device_id{i}, memory_resources.back());
+    }
+  }
+
+  return run_single_file(
+    file_name, initial_solution_file, solve_relaxation, mps_reader, settings, index_64bit);
+}

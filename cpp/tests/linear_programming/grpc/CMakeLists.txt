@@ -1,0 +1,202 @@
+# cmake-format: off
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# cmake-format: on
+
+# ##################################################################################################
+# - gRPC Client Unit Tests -------------------------------------------------------------------------
+# These tests use mock stubs and don't require a running server
+
+add_executable(GRPC_CLIENT_TEST
+    ${CMAKE_CURRENT_SOURCE_DIR}/grpc_client_test.cpp
+    "${CUOPT_SOURCE_DIR}/src/grpc/grpc_problem_mapper.cpp"
+    "${CUOPT_SOURCE_DIR}/src/grpc/grpc_service_mapper.cpp"
+    "${CUOPT_SOURCE_DIR}/src/grpc/grpc_settings_mapper.cpp"
+    "${CUOPT_SOURCE_DIR}/src/grpc/grpc_solution_mapper.cpp"
+    "${CUOPT_SOURCE_DIR}/src/grpc/client/grpc_client.cpp"
+    "${CUOPT_SOURCE_DIR}/src/grpc/client/grpc_client_env.cpp"
+)
+
+target_include_directories(GRPC_CLIENT_TEST
+    PRIVATE
+    "${CUOPT_SOURCE_DIR}/include"
+    "${CUOPT_SOURCE_DIR}/src"
+    "${CUOPT_SOURCE_DIR}/src/io"
+    "${CUOPT_SOURCE_DIR}/src/grpc"
+    "${CUOPT_SOURCE_DIR}/src/grpc/client"
+    "${CUOPT_SOURCE_DIR}/src/grpc/server"
+    "${CUOPT_SOURCE_DIR}/src/grpc/codegen/generated"
+    "${CUOPT_TEST_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}"  # For grpc_client_test_helper.hpp
+    "${CMAKE_BINARY_DIR}"  # For generated protobuf headers
+)
+
+target_link_libraries(GRPC_CLIENT_TEST
+    PRIVATE
+    cuopt_static
+    GTest::gmock
+    GTest::gmock_main
+    gRPC::grpc++
+    protobuf::libprotobuf
+)
+
+if(NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
+  target_link_options(GRPC_CLIENT_TEST PRIVATE -Wl,--enable-new-dtags)
+endif()
+
+rapids_test_add(NAME GRPC_CLIENT_TEST COMMAND GRPC_CLIENT_TEST INSTALL_COMPONENT_SET testing)
+set_tests_properties(GRPC_CLIENT_TEST PROPERTIES LABELS "numopt")
+
+install(
+    TARGETS GRPC_CLIENT_TEST
+    COMPONENT testing
+    DESTINATION bin/gtests/libcuopt
+    EXCLUDE_FROM_ALL
+)
+
+# ##################################################################################################
+# - gRPC Pipe Serialization Unit Tests -------------------------------------------------------------
+# These tests verify pipe serialization round-trips using real pipe(2) FDs.
+# No running server is required; pipe I/O functions are self-contained in the test.
+
+add_executable(GRPC_PIPE_SERIALIZATION_TEST
+    ${CMAKE_CURRENT_SOURCE_DIR}/grpc_pipe_serialization_test.cpp
+    "${CUOPT_SOURCE_DIR}/src/grpc/server/grpc_pipe_io.cpp"
+    "${CUOPT_SOURCE_DIR}/src/grpc/server/grpc_server_logger.cpp"
+)
+
+target_include_directories(GRPC_PIPE_SERIALIZATION_TEST
+    PRIVATE
+    "${CUOPT_SOURCE_DIR}/include"
+    "${CUOPT_SOURCE_DIR}/src/grpc"
+    "${CUOPT_SOURCE_DIR}/src/grpc/server"
+    "${CUOPT_SOURCE_DIR}/src/grpc/codegen/generated"
+    "${CMAKE_BINARY_DIR}"  # For generated protobuf headers
+)
+
+target_link_libraries(GRPC_PIPE_SERIALIZATION_TEST
+    PRIVATE
+    cuopt_static
+    GTest::gtest
+    GTest::gtest_main
+    protobuf::libprotobuf
+)
+
+if(NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
+  target_link_options(GRPC_PIPE_SERIALIZATION_TEST PRIVATE -Wl,--enable-new-dtags)
+endif()
+
+rapids_test_add(NAME GRPC_PIPE_SERIALIZATION_TEST COMMAND GRPC_PIPE_SERIALIZATION_TEST
+                 INSTALL_COMPONENT_SET testing)
+set_tests_properties(GRPC_PIPE_SERIALIZATION_TEST PROPERTIES LABELS "numopt")
+
+install(
+    TARGETS GRPC_PIPE_SERIALIZATION_TEST
+    COMPONENT testing
+    DESTINATION bin/gtests/libcuopt
+    EXCLUDE_FROM_ALL
+)
+
+# ##################################################################################################
+# - gRPC worker spawn argument checks --------------------------------------------------------------
+# Runs cuopt_grpc_server with internal and user argv. Both cases exit in the
+# argument parser, so no GPU or listening socket is required.
+
+add_executable(GRPC_WORKER_SPAWN_TEST ${CMAKE_CURRENT_SOURCE_DIR}/grpc_worker_spawn_test.cpp)
+
+target_link_libraries(GRPC_WORKER_SPAWN_TEST PRIVATE GTest::gtest GTest::gtest_main)
+
+if(NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
+  target_link_options(GRPC_WORKER_SPAWN_TEST PRIVATE -Wl,--enable-new-dtags)
+endif()
+
+add_dependencies(GRPC_WORKER_SPAWN_TEST cuopt_grpc_server)
+
+rapids_test_add(NAME GRPC_WORKER_SPAWN_TEST COMMAND GRPC_WORKER_SPAWN_TEST INSTALL_COMPONENT_SET testing)
+# ENVIRONMENT (not `cmake -E env`) so the installed CTestTestfile.cmake does not embed the build
+# environment's cmake path; the server path is remapped to its installed location.
+set_tests_properties(GRPC_WORKER_SPAWN_TEST PROPERTIES
+    LABELS "numopt"
+    ENVIRONMENT "CUOPT_GRPC_SERVER_PATH=$<TARGET_FILE:cuopt_grpc_server>")
+
+install(
+    TARGETS GRPC_WORKER_SPAWN_TEST
+    COMPONENT testing
+    DESTINATION bin/gtests/libcuopt
+    EXCLUDE_FROM_ALL
+)
+
+# ##################################################################################################
+# - gRPC job queue ordering ------------------------------------------------------------------------
+# Header-only checks of claim_ready_job_slot; no server or GPU is required.
+
+add_executable(GRPC_JOB_QUEUE_TEST ${CMAKE_CURRENT_SOURCE_DIR}/grpc_job_queue_test.cpp)
+
+target_compile_definitions(GRPC_JOB_QUEUE_TEST PRIVATE CUOPT_ENABLE_GRPC)
+
+target_include_directories(GRPC_JOB_QUEUE_TEST PRIVATE "${CUOPT_SOURCE_DIR}/src/grpc/server")
+
+target_link_libraries(GRPC_JOB_QUEUE_TEST PRIVATE GTest::gtest GTest::gtest_main Threads::Threads)
+
+if(NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
+  target_link_options(GRPC_JOB_QUEUE_TEST PRIVATE -Wl,--enable-new-dtags)
+endif()
+
+rapids_test_add(NAME GRPC_JOB_QUEUE_TEST COMMAND GRPC_JOB_QUEUE_TEST INSTALL_COMPONENT_SET testing)
+set_tests_properties(GRPC_JOB_QUEUE_TEST PROPERTIES LABELS "numopt")
+
+install(
+    TARGETS GRPC_JOB_QUEUE_TEST
+    COMPONENT testing
+    DESTINATION bin/gtests/libcuopt
+    EXCLUDE_FROM_ALL
+)
+
+# ##################################################################################################
+# - gRPC Integration Tests -------------------------------------------------------------------------
+# These tests start a real server process and run end-to-end tests
+
+add_executable(GRPC_MATHOPT_INTEGRATION_TEST
+    ${CMAKE_CURRENT_SOURCE_DIR}/grpc_mathopt_integration_test.cpp
+    "${CUOPT_SOURCE_DIR}/src/grpc/grpc_service_mapper.cpp"
+    "${CUOPT_SOURCE_DIR}/src/grpc/client/grpc_client.cpp"
+    "${CUOPT_SOURCE_DIR}/src/grpc/client/grpc_client_env.cpp"
+)
+
+target_include_directories(GRPC_MATHOPT_INTEGRATION_TEST
+    PRIVATE
+    "${CUOPT_SOURCE_DIR}/include"
+    "${CUOPT_SOURCE_DIR}/src"
+    "${CUOPT_SOURCE_DIR}/src/grpc"
+    "${CUOPT_SOURCE_DIR}/src/grpc/client"
+    "${CUOPT_TEST_DIR}"
+    "${CMAKE_BINARY_DIR}"  # For generated protobuf headers
+)
+
+target_link_libraries(GRPC_MATHOPT_INTEGRATION_TEST
+    PRIVATE
+    cuopt_static
+    GTest::gmock
+    GTest::gmock_main
+    gRPC::grpc++
+    protobuf::libprotobuf
+)
+
+if(NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
+  target_link_options(GRPC_MATHOPT_INTEGRATION_TEST PRIVATE -Wl,--enable-new-dtags)
+endif()
+
+# Integration tests need the server binary to be built first
+add_dependencies(GRPC_MATHOPT_INTEGRATION_TEST cuopt_grpc_server)
+
+rapids_test_add(NAME GRPC_MATHOPT_INTEGRATION_TEST COMMAND GRPC_MATHOPT_INTEGRATION_TEST INSTALL_COMPONENT_SET testing)
+set_tests_properties(GRPC_MATHOPT_INTEGRATION_TEST PROPERTIES
+    LABELS "numopt"
+    ENVIRONMENT "CUOPT_GRPC_SERVER_PATH=$<TARGET_FILE:cuopt_grpc_server>")
+
+install(
+    TARGETS GRPC_MATHOPT_INTEGRATION_TEST
+    COMPONENT testing
+    DESTINATION bin/gtests/libcuopt
+    EXCLUDE_FROM_ALL
+)

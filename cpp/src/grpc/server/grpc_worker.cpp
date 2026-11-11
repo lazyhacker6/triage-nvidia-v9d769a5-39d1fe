@@ -1,0 +1,1019 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifdef CUOPT_ENABLE_GRPC
+
+#include "grpc_incumbent_callbacks.hpp"
+#include "grpc_incumbent_proto.hpp"
+#include "grpc_pipe_serialization.hpp"
+#include "grpc_server_types.hpp"
+
+#ifdef CUOPT_ENABLE_GRPC_ROUTING
+#include "routing/grpc_routing_problem_mapper.hpp"
+#include "routing/grpc_routing_settings_mapper.hpp"
+#include "routing/grpc_routing_solution_mapper.hpp"
+
+#include <cuopt/routing/cpu_routing_problem.hpp>
+#include <cuopt/routing/solve.hpp>
+#include <cuopt/routing/solver_settings.hpp>
+#endif
+
+#include <cuopt/mathematical_optimization/optimization_problem_utils.hpp>
+#include <cuopt/mathematical_optimization/solver_settings.hpp>
+#include <rmm/device_buffer.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
+
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <limits>
+#include <memory>
+
+using cuopt::mathematical_optimization::apply_initial_solutions_to_mip_settings;
+using cuopt::mathematical_optimization::apply_initial_solutions_to_pdlp_settings;
+using cuopt::mathematical_optimization::apply_parameter_overrides;
+using cuopt::mathematical_optimization::map_proto_to_mip_settings;
+using cuopt::mathematical_optimization::map_proto_to_pdlp_settings;
+using cuopt::mathematical_optimization::map_proto_to_problem;
+#ifdef CUOPT_ENABLE_GRPC_ROUTING
+using cuopt::routing::map_proto_to_routing_problem;
+using cuopt::routing::map_proto_to_routing_settings;
+using cuopt::routing::map_routing_solution_to_proto;
+#endif
+
+namespace {
+
+enum class GpuProbeReason { STARTUP, BEFORE_JOB, IDLE };
+
+const char* gpu_probe_reason_name(GpuProbeReason reason)
+{
+  switch (reason) {
+    case GpuProbeReason::STARTUP: return "startup";
+    case GpuProbeReason::BEFORE_JOB: return "before-job";
+    case GpuProbeReason::IDLE: return "idle";
+  }
+  return "unknown";
+}
+
+std::chrono::milliseconds gpu_health_idle_interval()
+{
+#ifdef CUOPT_GRPC_TESTING
+  // Tests set this so the idle path does not wait the production 30s.
+  if (const char* env = std::getenv("CUOPT_GRPC_TEST_GPU_IDLE_MS")) {
+    char* end         = nullptr;
+    errno             = 0;
+    const long parsed = std::strtol(env, &end, 10);
+    if (errno == 0 && end != env && *end == '\0' && parsed > 0) {
+      return std::chrono::milliseconds(parsed);
+    }
+  }
+#endif
+  return std::chrono::seconds(30);
+}
+
+bool probe_worker_gpu_liveness(int worker_id, GpuProbeReason reason)
+{
+#ifdef CUOPT_GRPC_TESTING
+  // Absent unless a test sets it. Values match gpu_probe_reason_name().
+  if (const char* injected = std::getenv("CUOPT_GRPC_TEST_GPU_FAILURE")) {
+    if (std::strcmp(injected, gpu_probe_reason_name(reason)) == 0) {
+      SERVER_LOG_ERROR("[Worker %d] Injected %s GPU liveness probe failure",
+                       worker_id,
+                       gpu_probe_reason_name(reason));
+      return false;
+    }
+  }
+#endif
+
+  try {
+    // Allocate through the worker's current RMM resource, then submit and
+    // synchronize a real CUDA operation. This checks both the allocator path
+    // and asynchronous device execution without retaining meaningful memory.
+    const cuda::stream_ref stream{cudaStream_t{nullptr}};
+    rmm::device_buffer probe(1, stream);
+    cudaError_t err = cudaMemsetAsync(probe.data(), 0, probe.size(), stream.get());
+    if (err == cudaSuccess) { err = cudaStreamSynchronize(stream.get()); }
+    if (err != cudaSuccess) {
+      SERVER_LOG_ERROR("[Worker %d] %s GPU liveness probe failed: %s",
+                       worker_id,
+                       gpu_probe_reason_name(reason),
+                       cudaGetErrorString(err));
+      return false;
+    }
+  } catch (const std::exception& e) {
+    SERVER_LOG_ERROR("[Worker %d] %s RMM liveness probe failed: %s",
+                     worker_id,
+                     gpu_probe_reason_name(reason),
+                     e.what());
+    return false;
+  }
+  return true;
+}
+
+[[noreturn]] void exit_gpu_unhealthy(int worker_id, const char* context)
+{
+  SERVER_LOG_ERROR(
+    "[Worker %d] GPU unhealthy during %s; requesting server shutdown", worker_id, context);
+  _exit(kGpuUnhealthyExitCode);
+}
+
+int parse_pool_gigs_env()
+{
+  int pool_gigs = 1;
+  if (const char* env = std::getenv("CUOPT_GIGABYTES_PER_PROC")) {
+    char* end              = nullptr;
+    errno                  = 0;
+    const long long parsed = std::strtoll(env, &end, 10);
+    if (errno == 0 && end != env && *end == '\0' && parsed > 0 &&
+        parsed <= std::numeric_limits<int>::max()) {
+      pool_gigs = static_cast<int>(parsed);
+    } else {
+      SERVER_LOG_WARN("[Worker] Ignoring invalid CUOPT_GIGABYTES_PER_PROC='%s'", env);
+    }
+  }
+  return pool_gigs;
+}
+
+void init_worker_rmm_pool()
+{
+  const int pool_gigs = parse_pool_gigs_env();
+
+  // Keep the pool alive for the lifetime of this worker process.
+  static std::unique_ptr<rmm::mr::pool_memory_resource> pool_mr;
+  static bool initialized = false;
+  if (initialized) { return; }
+
+  pool_mr = std::make_unique<rmm::mr::pool_memory_resource>(
+    rmm::mr::cuda_memory_resource(), static_cast<std::size_t>(pool_gigs) * (1ULL << 30));
+  rmm::mr::set_current_device_resource(*pool_mr);
+  initialized = true;
+
+  SERVER_LOG_INFO("[Worker] RMM pool size: %d GiB", pool_gigs);
+}
+
+}  // namespace
+
+bool init_worker_cuda_environment(int worker_id)
+{
+  int device_count            = 0;
+  const cudaError_t count_err = cudaGetDeviceCount(&device_count);
+  if (count_err != cudaSuccess || device_count <= 0) {
+    SERVER_LOG_ERROR(
+      "[Worker %d] cudaGetDeviceCount failed (%s)", worker_id, cudaGetErrorString(count_err));
+    return false;
+  }
+
+  const int device          = worker_id % device_count;
+  const cudaError_t set_err = cudaSetDevice(device);
+  if (set_err != cudaSuccess) {
+    SERVER_LOG_ERROR(
+      "[Worker %d] cudaSetDevice(%d) failed: %s", worker_id, device, cudaGetErrorString(set_err));
+    return false;
+  }
+
+  init_worker_rmm_pool();
+
+  SERVER_LOG_INFO("[Worker %d] Using CUDA device %d of %d", worker_id, device, device_count);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Data-transfer structs used to pass results between decomposed functions.
+// ---------------------------------------------------------------------------
+
+struct DeserializedJob {
+  cuopt::mathematical_optimization::cpu_optimization_problem_t<int, double> problem;
+  // Owns both LP and MIP settings so parameters() can be applied with
+  // set_parameter_from_string(). Not movable; fill it in place.
+  cuopt::mathematical_optimization::solver_settings_t<int, double> settings;
+#ifdef CUOPT_ENABLE_GRPC_ROUTING
+  cuopt::routing::cpu_routing_problem_t routing_problem;
+  cuopt::routing::solver_settings_t<int, float> routing_settings;
+#endif
+  bool enable_incumbents    = true;
+  bool enable_set_incumbent = false;
+  bool is_vrp               = false;
+  bool success              = false;
+  std::string error_message;
+};
+
+// Applies the set_parameter() map. map_proto_to_*_settings copies deprecated
+// typed fields only when this map is empty, and always copies warm start and
+// presolve_absolute_tolerance. Returns false and stores the message when a
+// key or value is rejected. The caller fails that job; it does not kill the
+// worker.
+template <typename PbSettings>
+bool apply_job_parameters(DeserializedJob& dj, const PbSettings& pb_settings)
+{
+  try {
+    apply_parameter_overrides(dj.settings, pb_settings.parameters());
+  } catch (const std::exception& e) {
+    dj.error_message = std::string("Invalid solver parameter: ") + e.what();
+    return false;
+  }
+  return true;
+}
+
+// Warm start is checked against the reconstructed problem before it is stored.
+// A rejected payload fails this job, so copy_warmstart_data_to_device never
+// sees it.
+bool apply_lp_job_settings(DeserializedJob& dj,
+                           const cuopt::remote::PDLPSolverSettings& pb_settings)
+{
+  try {
+    map_proto_to_pdlp_settings(
+      pb_settings, dj.settings, dj.problem.get_n_variables(), dj.problem.get_n_constraints());
+  } catch (const std::exception& e) {
+    dj.error_message = e.what();
+    return false;
+  }
+  return apply_job_parameters(dj, pb_settings);
+}
+
+struct SolveResult {
+  cuopt::remote::ChunkedResultHeader header;
+  std::map<int32_t, std::vector<uint8_t>> arrays;
+  std::string error_message;
+  bool success = false;
+};
+
+// ---------------------------------------------------------------------------
+// Solver callback that forwards each new MIP incumbent to the server thread
+// via a pipe.  A fresh instance is created per solve (as a unique_ptr scoped
+// to run_mip_solve) and registered with mip_settings.set_mip_callback().
+// The solver calls get_solution() every time it finds a better integer-feasible
+// solution; we serialize the objective, bound, and variable assignment into a protobuf
+// and push it down the incumbent pipe FD.  The server thread reads the other
+// end to serve GetIncumbents RPCs.
+// ---------------------------------------------------------------------------
+
+class IncumbentPipeCallback : public cuopt::internals::get_solution_callback_t {
+ public:
+  IncumbentPipeCallback(
+    std::string job_id, int fd, size_t num_vars, bool is_float, bool capture_last)
+    : job_id_(std::move(job_id)), fd_(fd), state_(num_vars, is_float), capture_last_(capture_last)
+  {
+    n_variables = num_vars;
+    isFloat     = is_float;
+  }
+
+  // Called by the MIP solver each time a new incumbent is found.
+  // data/objective_value/solution_bound arrive as raw void* whose actual type
+  // depends on isFloat; we normalize everything to double before serializing.
+  void get_solution(void* data,
+                    void* objective_value,
+                    void* solution_bound,
+                    void* /*user_data*/) override
+  {
+    if (n_variables == 0) { return; }
+
+    if (capture_last_) { state_.record_get_solution(data, objective_value); }
+
+    if (fd_ < 0) { return; }
+
+    double objective = 0.0;
+    double bound     = 0.0;
+    std::vector<double> assignment;
+    assignment.resize(n_variables);
+
+    if (isFloat) {
+      const float* float_data = static_cast<const float*>(data);
+      for (size_t i = 0; i < n_variables; ++i) {
+        assignment[i] = static_cast<double>(float_data[i]);
+      }
+      objective = static_cast<double>(*static_cast<const float*>(objective_value));
+      bound     = static_cast<double>(*static_cast<const float*>(solution_bound));
+    } else {
+      const double* double_data = static_cast<const double*>(data);
+      std::copy(double_data, double_data + n_variables, assignment.begin());
+      objective = *static_cast<const double*>(objective_value);
+      bound     = *static_cast<const double*>(solution_bound);
+    }
+
+    auto buffer = build_incumbent_proto(job_id_, objective, bound, assignment);
+    if (!send_incumbent_pipe(fd_, buffer)) {
+      SERVER_LOG_ERROR("[Worker] Incumbent pipe write failed for job %s, disabling further sends",
+                       job_id_.c_str());
+      fd_ = -1;
+      return;
+    }
+  }
+
+  cuopt::remote::detail::LastIncumbentState* state() { return &state_; }
+
+ private:
+  std::string job_id_;
+  int fd_;
+  cuopt::remote::detail::LastIncumbentState state_;
+  bool capture_last_;
+};
+
+// ---------------------------------------------------------------------------
+// Small utility helpers
+// ---------------------------------------------------------------------------
+
+// Log pipe throughput when config.verbose is enabled.
+static void log_pipe_throughput(const char* phase,
+                                int64_t total_bytes,
+                                std::chrono::steady_clock::time_point t0)
+{
+  auto pipe_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
+      .count();
+  double pipe_sec = pipe_us / 1e6;
+  double pipe_mb  = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
+  double pipe_mbs = (pipe_sec > 0.0) ? (pipe_mb / pipe_sec) : 0.0;
+  SERVER_LOG_INFO("[THROUGHPUT] phase=%s bytes=%ld elapsed_ms=%.1f throughput_mb_s=%.1f",
+                  phase,
+                  total_bytes,
+                  pipe_us / 1000.0,
+                  pipe_mbs);
+}
+
+// Copy a device vector of T to a newly allocated host std::vector<T>.
+template <typename T>
+static std::vector<T> device_to_host(const auto& device_vec)
+{
+  std::vector<T> host(device_vec.size());
+  cudaError_t err = cudaMemcpy(
+    host.data(), device_vec.data(), device_vec.size() * sizeof(T), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMemcpy device-to-host failed: ") +
+                             cudaGetErrorString(err));
+  }
+  return host;
+}
+
+// Write a result entry with no payload (error, cancellation, etc.) into the
+// first free slot in the shared-memory result_queue.
+//
+// Lock-free protocol for cross-process writes (one process per worker):
+//   1. Skip slots where ready==true (still being consumed by the reader).
+//   2. CAS claimed false→true to get exclusive write access.  Another
+//      writer (different worker process) that races on the same slot will
+//      see the CAS fail and move to the next slot.
+//   3. Re-check ready after claiming, in case the reader set ready=true
+//      between step 1 and step 2.
+//   4. Write all non-atomic fields, then publish with ready=true (release)
+//      so the reader sees a consistent entry.
+//   5. Clear claimed so the slot can be recycled after the reader is done.
+//
+// The same protocol is used by publish_result() and the crash-recovery
+// path in grpc_worker_infra.cpp.
+static void store_simple_result(const std::string& job_id,
+                                int worker_id,
+                                ResultStatus status,
+                                const char* error_message)
+{
+  for (size_t i = 0; i < MAX_RESULTS; ++i) {
+    if (result_queue[i].ready.load(std::memory_order_acquire)) continue;
+    bool expected = false;
+    if (!result_queue[i].claimed.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+      continue;
+    }
+    if (result_queue[i].ready.load(std::memory_order_acquire)) {
+      result_queue[i].claimed.store(false, std::memory_order_release);
+      continue;
+    }
+    copy_cstr(result_queue[i].job_id, job_id);
+    result_queue[i].status    = status;
+    result_queue[i].data_size = 0;
+    result_queue[i].worker_index.store(worker_id, std::memory_order_relaxed);
+    copy_cstr(result_queue[i].error_message, error_message);
+    result_queue[i].error_message[sizeof(result_queue[i].error_message) - 1] = '\0';
+    result_queue[i].retrieved.store(false, std::memory_order_relaxed);
+    result_queue[i].ready.store(true, std::memory_order_release);
+    result_queue[i].claimed.store(false, std::memory_order_release);
+    break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stage functions called from the worker_process main loop
+// ---------------------------------------------------------------------------
+
+// Atomically claim the oldest ready-but-unclaimed job by enqueue_seq.
+static int claim_job_slot(int worker_id)
+{
+  return claim_ready_job_slot(job_queue, MAX_JOBS, worker_id, getpid());
+}
+
+// Unified chunked upload: the pipe header is a SubmitJobRequest with numeric
+// arrays empty. Array bytes use the same framing as the legacy header.
+static bool read_unified_chunked_from_pipe(int read_fd, DeserializedJob& dj)
+{
+  cuopt::remote::SubmitJobRequest request;
+  std::map<int32_t, std::vector<uint8_t>> arrays;
+  std::map<cuopt::mathematical_optimization::container_array_key_t, std::vector<uint8_t>>
+    container_arrays;
+  if (!read_chunked_request_from_pipe(read_fd, request, arrays, container_arrays)) { return false; }
+
+  try {
+    if (request.has_lp_request()) {
+      const auto& req = request.lp_request();
+      SERVER_LOG_INFO("[Worker] IPC path: CHUNKED unified LP (%zu arrays, %zu container arrays)",
+                      arrays.size(),
+                      container_arrays.size());
+      cuopt::mathematical_optimization::map_proto_to_problem(
+        req.problem(), arrays, container_arrays, dj.problem);
+      if (!apply_lp_job_settings(dj, req.settings())) { return false; }
+    } else if (request.has_mip_request()) {
+      const auto& req = request.mip_request();
+      SERVER_LOG_INFO("[Worker] IPC path: CHUNKED unified MIP (%zu arrays, %zu container arrays)",
+                      arrays.size(),
+                      container_arrays.size());
+      cuopt::mathematical_optimization::map_proto_to_problem(
+        req.problem(), arrays, container_arrays, dj.problem);
+      map_proto_to_mip_settings(req.settings(), dj.settings);
+      if (!apply_job_parameters(dj, req.settings())) { return false; }
+      dj.enable_incumbents    = req.has_enable_incumbents() ? req.enable_incumbents() : true;
+      dj.enable_set_incumbent = req.has_enable_set_incumbent() ? req.enable_set_incumbent() : false;
+    } else if (request.has_vrp_request()) {
+#ifdef CUOPT_ENABLE_GRPC_ROUTING
+      const auto& req = request.vrp_request();
+      SERVER_LOG_INFO("[Worker] IPC path: CHUNKED VRP (%zu container arrays)",
+                      container_arrays.size());
+      map_proto_to_routing_problem(req.problem(), dj.routing_problem, arrays, container_arrays);
+      map_proto_to_routing_settings(req.settings(), dj.routing_settings);
+      dj.is_vrp = true;
+#else
+      SERVER_LOG_ERROR("[Worker] VRP request received but this build has no routing support");
+      return false;
+#endif
+    } else {
+      dj.error_message = "Unified chunked upload has no problem";
+      return false;
+    }
+  } catch (const std::exception& e) {
+    dj.error_message = e.what();
+    return false;
+  }
+  return true;
+}
+
+// Deserialize the problem from the worker's pipe.  Handles both chunked and
+// unary IPC formats.  On error, dj.success stays false and dj.error_message
+// may explain why. solver_settings_t is not movable, so the job is filled in
+// place rather than returned.
+static void read_problem_from_pipe(int worker_id, const JobQueueEntry& job, DeserializedJob& dj)
+{
+  int read_fd         = worker_pipes[worker_id].worker_read_fd;
+  bool is_chunked_job = job.is_chunked.load();
+
+  auto pipe_recv_t0 = std::chrono::steady_clock::now();
+
+  if (is_chunked_job && job.unified_header.load()) {
+    if (!read_unified_chunked_from_pipe(read_fd, dj)) { return; }
+    dj.success = true;
+    return;
+  }
+
+  if (is_chunked_job) {
+    if (job.problem_category == cuopt::remote::VRP) {
+      SERVER_LOG_ERROR("[Worker] Chunked VRP requires the unified header");
+      dj.error_message = "Chunked VRP requires the unified header";
+      return;
+    }
+    // Chunked path: the server wrote a ChunkedProblemHeader followed by
+    // a set of raw typed arrays (constraint matrix, bounds, etc.).
+    // This avoids a single giant protobuf allocation for large problems.
+    cuopt::remote::ChunkedProblemHeader chunked_header;
+    std::map<int32_t, std::vector<uint8_t>> arrays;
+    std::map<cuopt::mathematical_optimization::container_array_key_t, std::vector<uint8_t>>
+      container_arrays;
+    if (!read_chunked_request_from_pipe(read_fd, chunked_header, arrays, container_arrays)) {
+      return;
+    }
+
+    if (config.verbose) {
+      int64_t total_bytes = 0;
+      for (const auto& [fid, data] : arrays) {
+        total_bytes += data.size();
+      }
+      int64_t container_total_bytes = 0;
+      for (const auto& [key, data] : container_arrays) {
+        container_total_bytes += data.size();
+      }
+      log_pipe_throughput("pipe_job_recv", total_bytes + container_total_bytes, pipe_recv_t0);
+      SERVER_LOG_INFO(
+        "[Worker] IPC path: CHUNKED (%zu top-level arrays, %ld bytes; %zu container "
+        "arrays, %ld bytes)",
+        arrays.size(),
+        total_bytes,
+        container_arrays.size(),
+        container_total_bytes);
+    }
+    dj.enable_incumbents    = chunked_header.enable_incumbents();
+    dj.enable_set_incumbent = chunked_header.enable_set_incumbent();
+    // Problem first: warm-start lengths are checked against these dimensions.
+    cuopt::mathematical_optimization::map_chunked_arrays_to_problem(
+      chunked_header, arrays, container_arrays, dj.problem);
+    if (chunked_header.has_lp_settings()) {
+      if (!apply_lp_job_settings(dj, chunked_header.lp_settings())) { return; }
+    }
+    if (chunked_header.has_mip_settings()) {
+      map_proto_to_mip_settings(chunked_header.mip_settings(), dj.settings);
+      if (!apply_job_parameters(dj, chunked_header.mip_settings())) { return; }
+    }
+  } else {
+    // Unary path: the entire SubmitJobRequest was serialized as a single
+    // protobuf blob.  Simpler but copies more memory for large problems.
+    std::vector<uint8_t> request_data;
+    if (!recv_job_data_pipe(read_fd, job.data_size, request_data)) { return; }
+
+    if (config.verbose) {
+      log_pipe_throughput("pipe_job_recv", static_cast<int64_t>(request_data.size()), pipe_recv_t0);
+    }
+    cuopt::remote::SubmitJobRequest submit_request;
+    if (!submit_request.ParseFromArray(request_data.data(),
+                                       static_cast<int>(request_data.size())) ||
+        (!submit_request.has_lp_request() && !submit_request.has_mip_request() &&
+         !submit_request.has_vrp_request())) {
+      return;
+    }
+    if (submit_request.has_lp_request()) {
+      const auto& req = submit_request.lp_request();
+      SERVER_LOG_INFO("[Worker] IPC path: UNARY LP (%zu bytes)", request_data.size());
+      map_proto_to_problem(req.problem(), dj.problem);
+      if (!apply_lp_job_settings(dj, req.settings())) { return; }
+    } else if (submit_request.has_mip_request()) {
+      const auto& req = submit_request.mip_request();
+      SERVER_LOG_INFO("[Worker] IPC path: UNARY MIP (%zu bytes)", request_data.size());
+      map_proto_to_problem(req.problem(), dj.problem);
+      map_proto_to_mip_settings(req.settings(), dj.settings);
+      if (!apply_job_parameters(dj, req.settings())) { return; }
+      dj.enable_incumbents    = req.has_enable_incumbents() ? req.enable_incumbents() : true;
+      dj.enable_set_incumbent = req.has_enable_set_incumbent() ? req.enable_set_incumbent() : false;
+    } else {
+#ifdef CUOPT_ENABLE_GRPC_ROUTING
+      const auto& req = submit_request.vrp_request();
+      SERVER_LOG_INFO("[Worker] IPC path: UNARY VRP (%zu bytes)", request_data.size());
+      map_proto_to_routing_problem(req.problem(), dj.routing_problem);
+      map_proto_to_routing_settings(req.settings(), dj.routing_settings);
+      dj.is_vrp = true;
+#else
+      SERVER_LOG_ERROR("[Worker] VRP request received but this build has no routing support");
+      return;
+#endif
+    }
+  }
+
+  dj.success = true;
+  return;
+}
+
+// Run the MIP solver on the GPU and serialize the solution into chunked format.
+// The incumbent callback is created and scoped here so it lives exactly as
+// long as the solve.  Exceptions are caught and returned as error messages.
+static SolveResult run_mip_solve(DeserializedJob& dj,
+                                 raft::handle_t& handle,
+                                 const std::string& log_file,
+                                 const std::string& job_id,
+                                 int worker_id)
+{
+  SolveResult sr;
+  try {
+    // After client parameters, so the server log path wins. Both names are
+    // registered on the LP and MIP settings, and each call writes every match.
+    dj.settings.set_parameter_from_string(CUOPT_LOG_FILE, log_file);
+    dj.settings.set_parameter(CUOPT_LOG_TO_CONSOLE, config.log_to_console);
+    apply_initial_solutions_to_mip_settings(dj.problem, dj.settings.get_mip_settings());
+
+    // Create a per-solve incumbent callback wired to this worker's
+    // incumbent pipe.  Destroyed automatically when sr is returned.
+    std::unique_ptr<IncumbentPipeCallback> incumbent_cb;
+    std::unique_ptr<cuopt::remote::detail::EchoSetSolutionCallback> set_cb;
+    const size_t n_vars = static_cast<size_t>(dj.problem.get_n_variables());
+    if (dj.enable_incumbents || dj.enable_set_incumbent) {
+      const int fd = dj.enable_incumbents ? worker_pipes[worker_id].worker_incumbent_write_fd : -1;
+      incumbent_cb =
+        std::make_unique<IncumbentPipeCallback>(job_id, fd, n_vars, false, dj.enable_set_incumbent);
+      dj.settings.get_mip_settings().set_mip_callback(incumbent_cb.get());
+      SERVER_LOG_INFO("[Worker] Registered incumbent callback for job_id=%s n_vars=%d",
+                      job_id.c_str(),
+                      dj.problem.get_n_variables());
+    }
+    if (dj.enable_set_incumbent) {
+      set_cb = std::make_unique<cuopt::remote::detail::EchoSetSolutionCallback>(
+        incumbent_cb->state(), n_vars, false);
+      dj.settings.get_mip_settings().set_mip_callback(set_cb.get());
+      SERVER_LOG_INFO("[Worker] Registered incumbent set callback for job_id=%s", job_id.c_str());
+    }
+
+    SERVER_LOG_INFO("[Worker] Converting CPU problem to GPU problem...");
+    auto gpu_problem = to_optimization_problem(dj.problem, &handle);
+
+    SERVER_LOG_INFO("[Worker] Calling solve_mip...");
+    auto gpu_solution =
+      cuopt::mathematical_optimization::solve_mip(*gpu_problem, dj.settings.get_mip_settings());
+    SERVER_LOG_INFO("[Worker] solve_mip done");
+
+    // solve_mip_helper catches cuopt::logic_error internally and stashes it
+    // in mip_solution_t::error_status_ rather than rethrow (matches the LP
+    // path's solver-API contract).  Forward the error back to the client
+    // instead of shipping a zero-filled "successful" result.
+    {
+      const auto& err = gpu_solution.get_error_status();
+      if (err.get_error_type() != cuopt::error_type_t::Success) {
+        sr.error_message = format_cuopt_error(err);
+        return sr;
+      }
+    }
+
+    SERVER_LOG_INFO("[Worker] Converting solution to CPU format...");
+
+    auto host_solution = device_to_host<double>(gpu_solution.get_solution());
+
+    cuopt::mathematical_optimization::cpu_mip_solution_t<int, double> cpu_solution(
+      std::move(host_solution),
+      gpu_solution.get_termination_status(),
+      gpu_solution.get_objective_value(),
+      gpu_solution.get_mip_gap(),
+      gpu_solution.get_solution_bound(),
+      gpu_solution.get_total_solve_time(),
+      gpu_solution.get_presolve_time(),
+      gpu_solution.get_max_constraint_violation(),
+      gpu_solution.get_max_int_violation(),
+      gpu_solution.get_max_variable_bound_violation(),
+      gpu_solution.get_num_nodes(),
+      gpu_solution.get_num_simplex_iterations());
+
+    cuopt::mathematical_optimization::populate_chunked_result_header_mip(cpu_solution, &sr.header);
+    sr.arrays = cuopt::mathematical_optimization::collect_mip_solution_arrays(cpu_solution);
+    SERVER_LOG_INFO("[Worker] Result path: MIP solution -> %zu array(s)", sr.arrays.size());
+    sr.success = true;
+  } catch (const cuopt::logic_error& e) {
+    sr.error_message = format_cuopt_error(e);
+  } catch (const std::exception& e) {
+    sr.error_message = std::string("RuntimeError: ") + e.what();
+  }
+  return sr;
+}
+
+// Run the LP solver on the GPU and serialize the solution into chunked format.
+// No incumbent callback (LP solvers don't produce intermediate solutions).
+// Exceptions are caught and returned as error messages.
+static SolveResult run_lp_solve(DeserializedJob& dj,
+                                raft::handle_t& handle,
+                                const std::string& log_file)
+{
+  SolveResult sr;
+  try {
+    // After client parameters, so the server log path wins. Both names are
+    // registered on the LP and MIP settings, and each call writes every match.
+    dj.settings.set_parameter_from_string(CUOPT_LOG_FILE, log_file);
+    dj.settings.set_parameter(CUOPT_LOG_TO_CONSOLE, config.log_to_console);
+    apply_initial_solutions_to_pdlp_settings(dj.problem, dj.settings.get_pdlp_settings());
+    cuopt::mathematical_optimization::copy_warmstart_data_to_device(dj.settings, &handle);
+
+    SERVER_LOG_INFO("[Worker] Converting CPU problem to GPU problem...");
+    auto gpu_problem = to_optimization_problem(dj.problem, &handle);
+
+    SERVER_LOG_INFO("[Worker] Calling solve_lp...");
+    // Multi-GPU PDLP needs the host-resident mps_data_model_t overload, not the GPU problem.
+    auto& pdlp_settings = dj.settings.get_pdlp_settings();
+    auto gpu_solution =
+      cuopt::mathematical_optimization::is_multigpu_pdlp_requested(pdlp_settings)
+        ? cuopt::mathematical_optimization::solve_lp(
+            &handle,
+            cuopt::mathematical_optimization::op_problem_to_mps_data_model(*gpu_problem),
+            pdlp_settings)
+        : cuopt::mathematical_optimization::solve_lp(*gpu_problem, pdlp_settings);
+    SERVER_LOG_INFO("[Worker] solve_lp done");
+
+    // solve_lp / solve_qcqp catch cuopt::logic_error internally and stash it
+    // in optimization_problem_solution_t::error_status_ rather than rethrow
+    // (long-standing solver-API contract; see solve.cu).  Forward the error
+    // back to the client instead of shipping a zero-filled "successful"
+    // result; otherwise validation failures (e.g. SOC's rhs=0 requirement)
+    // silently succeed on the wire.
+    {
+      const auto err = gpu_solution.get_error_status();
+      if (err.get_error_type() != cuopt::error_type_t::Success) {
+        sr.error_message = format_cuopt_error(err);
+        return sr;
+      }
+    }
+
+    SERVER_LOG_INFO("[Worker] Converting solution to CPU format...");
+
+    auto host_primal       = device_to_host<double>(gpu_solution.get_primal_solution());
+    auto host_dual         = device_to_host<double>(gpu_solution.get_dual_solution());
+    auto host_reduced_cost = device_to_host<double>(gpu_solution.get_reduced_cost());
+
+    auto term_info = gpu_solution.get_additional_termination_information();
+
+    // Warm-start data lets clients resume an interrupted LP solve from
+    // where it left off without starting over.
+    auto cpu_ws = cuopt::mathematical_optimization::convert_to_cpu_warmstart(
+      gpu_solution.get_pdlp_warm_start_data(), handle.get_stream());
+
+    cuopt::mathematical_optimization::cpu_lp_solution_t<int, double> cpu_solution(
+      std::move(host_primal),
+      std::move(host_dual),
+      std::move(host_reduced_cost),
+      gpu_solution.get_termination_status(),
+      gpu_solution.get_objective_value(),
+      gpu_solution.get_dual_objective_value(),
+      term_info.solve_time,
+      term_info.l2_primal_residual,
+      term_info.l2_dual_residual,
+      term_info.gap,
+      term_info.number_of_steps_taken,
+      term_info.solved_by,
+      std::move(cpu_ws));
+
+    cuopt::mathematical_optimization::populate_chunked_result_header_lp(cpu_solution, &sr.header);
+    sr.arrays = cuopt::mathematical_optimization::collect_lp_solution_arrays(cpu_solution);
+    SERVER_LOG_INFO("[Worker] Result path: LP solution -> %zu array(s)", sr.arrays.size());
+    sr.success = true;
+  } catch (const cuopt::logic_error& e) {
+    sr.error_message = format_cuopt_error(e);
+  } catch (const std::exception& e) {
+    sr.error_message = std::string("RuntimeError: ") + e.what();
+  }
+  return sr;
+}
+
+// Run the routing solver on the GPU and embed the RoutingSolution proto in
+// ChunkedResultHeader (VRP results are typically small; no array chunking).
+static SolveResult run_vrp_solve([[maybe_unused]] DeserializedJob& dj,
+                                 [[maybe_unused]] raft::handle_t& handle)
+{
+  SolveResult sr;
+#ifndef CUOPT_ENABLE_GRPC_ROUTING
+  sr.error_message = "ValidationError: this server was built without routing support";
+  return sr;
+#else
+  try {
+    auto [view, device_data] = dj.routing_problem.to_device(&handle);
+    auto solve_t0            = std::chrono::steady_clock::now();
+    auto assignment          = cuopt::routing::solve(view, dj.routing_settings);
+    double solve_time =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - solve_t0).count();
+    cuopt::routing::host_assignment_t<int> host(assignment);
+
+    sr.header.set_problem_category(cuopt::remote::VRP);
+    sr.header.set_is_vrp(true);
+    // Embed the RoutingSolution structurally (ChunkedResultHeader.routing_solution
+    // is a message field now, not a serialized blob).
+    auto* routing_sol = sr.header.mutable_routing_solution();
+    map_routing_solution_to_proto(assignment, host, routing_sol);
+    routing_sol->set_solve_time(solve_time);
+    SERVER_LOG_INFO(
+      "[Worker] Result path: VRP solution -> embedded RoutingSolution (%zu bytes) solve_time=%.6f "
+      "s",
+      routing_sol->ByteSizeLong(),
+      solve_time);
+    sr.success = true;
+  } catch (const cuopt::logic_error& e) {
+    sr.error_message = format_cuopt_error(e);
+  } catch (const std::exception& e) {
+    sr.error_message = std::string("RuntimeError: ") + e.what();
+  }
+  return sr;
+#endif
+}
+
+// Publish a solve result: claim a slot in the shared-memory result_queue
+// (metadata) and, for successful solves, stream the full solution payload
+// through the worker's result pipe for the server thread to read.
+static void publish_result(const SolveResult& sr, const std::string& job_id, int worker_id)
+{
+  int64_t result_total_bytes = 0;
+  if (sr.success) {
+    for (const auto& [fid, data] : sr.arrays) {
+      result_total_bytes += data.size();
+    }
+    // VRP embeds its solution in the header (sr.header.routing_solution), not in
+    // sr.arrays. Count it too, otherwise data_size stays ~0 and the GetResult
+    // oversized-result guard (RESOURCE_EXHAUSTED) and reported size are wrong.
+    result_total_bytes += static_cast<int64_t>(sr.header.routing_solution().ByteSizeLong());
+  }
+
+  // Same CAS protocol as store_simple_result (see comment there).
+  int result_slot = -1;
+  for (size_t i = 0; i < MAX_RESULTS; ++i) {
+    if (result_queue[i].ready.load(std::memory_order_acquire)) continue;
+    bool expected = false;
+    if (!result_queue[i].claimed.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+      continue;
+    }
+    if (result_queue[i].ready.load(std::memory_order_acquire)) {
+      result_queue[i].claimed.store(false, std::memory_order_release);
+      continue;
+    }
+    result_slot              = static_cast<int>(i);
+    ResultQueueEntry& result = result_queue[i];
+    copy_cstr(result.job_id, job_id);
+    result.status    = sr.success ? RESULT_SUCCESS : RESULT_ERROR;
+    result.data_size = sr.success ? std::max<uint64_t>(result_total_bytes, 1) : 0;
+    result.worker_index.store(worker_id, std::memory_order_relaxed);
+    if (!sr.success) { copy_cstr(result.error_message, sr.error_message); }
+    result.retrieved.store(false, std::memory_order_relaxed);
+    result.ready.store(true, std::memory_order_release);
+    result.claimed.store(false, std::memory_order_release);
+    if (config.verbose) {
+      SERVER_LOG_DEBUG(
+        "[Worker %d] Enqueued result metadata for job %s in result_slot=%d status=%d data_size=%lu",
+        worker_id,
+        job_id.c_str(),
+        result_slot,
+        static_cast<int>(result.status),
+        result.data_size);
+    }
+    break;
+  }
+
+  // Stream the full solution payload through the worker's result pipe.
+  // The server thread reads the other end when the client calls
+  // GetResult / DownloadChunk.
+  if (sr.success && result_slot >= 0) {
+    int write_fd = worker_pipes[worker_id].worker_write_fd;
+    if (config.verbose) {
+      SERVER_LOG_DEBUG("[Worker %d] Streaming result (%zu arrays, %ld bytes) to pipe for job %s",
+                       worker_id,
+                       sr.arrays.size(),
+                       result_total_bytes,
+                       job_id.c_str());
+    }
+    auto pipe_result_t0 = std::chrono::steady_clock::now();
+    bool write_success  = write_result_to_pipe(write_fd, sr.header, sr.arrays);
+    if (write_success && config.verbose) {
+      log_pipe_throughput("pipe_result_send", result_total_bytes, pipe_result_t0);
+    }
+    if (!write_success) {
+      SERVER_LOG_ERROR("[Worker %d] Failed to write result to pipe", worker_id);
+      result_queue[result_slot].status = RESULT_ERROR;
+      copy_cstr(result_queue[result_slot].error_message, "Failed to write result to pipe");
+    } else if (config.verbose) {
+      SERVER_LOG_DEBUG(
+        "[Worker %d] Finished writing result payload for job %s", worker_id, job_id.c_str());
+    }
+  } else if (config.verbose) {
+    SERVER_LOG_DEBUG(
+      "[Worker %d] No result payload write needed for job %s (success=%d, result_slot=%d, "
+      "payload_bytes=%ld)",
+      worker_id,
+      job_id.c_str(),
+      static_cast<int>(sr.success),
+      result_slot,
+      result_total_bytes);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main worker loop — pure policy.  All implementation detail is in the
+// stage functions above.
+// ---------------------------------------------------------------------------
+
+void worker_process(int worker_id, bool is_replacement)
+{
+  SERVER_LOG_INFO("[Worker %d] Started (PID: %d)", worker_id, getpid());
+
+  // The parent blocks SIGINT/SIGTERM before posix_spawn, and that mask survives
+  // exec. Ignore them here too so a process-group Ctrl-C does not kill a
+  // mid-solve worker while the parent is still shutting workers down.
+  signal(SIGINT, SIG_IGN);
+  signal(SIGTERM, SIG_IGN);
+
+  try {
+    if (!init_worker_cuda_environment(worker_id) ||
+        !probe_worker_gpu_liveness(worker_id, GpuProbeReason::STARTUP)) {
+      exit_gpu_unhealthy(worker_id, "initialization");
+    }
+  } catch (const std::exception& e) {
+    SERVER_LOG_ERROR(
+      "[Worker %d] CUDA/RMM environment initialization failed: %s", worker_id, e.what());
+    exit_gpu_unhealthy(worker_id, "initialization");
+  }
+
+#ifdef CUOPT_GRPC_TESTING
+  // Hang after a successful startup probe but before publishing ready, so the
+  // parent ready timeout can be exercised without a stuck CUDA driver.
+  // "initial" hangs the original spawn. "respawn" hangs replacements.
+  if (const char* hang = std::getenv("CUOPT_GRPC_TEST_WORKER_READY_HANG")) {
+    const bool hang_this_worker = (is_replacement && std::strcmp(hang, "respawn") == 0) ||
+                                  (!is_replacement && std::strcmp(hang, "initial") == 0);
+    if (hang_this_worker) {
+      SERVER_LOG_ERROR("[Worker %d] Injected worker-ready hang", worker_id);
+      while (!shm_ctrl->shutdown_requested) {
+        sleep(1);
+      }
+      _exit(0);
+    }
+  }
+#else
+  (void)is_replacement;
+#endif
+
+  // Publish ready only after init + startup probe. The monitor waits on this
+  // for the original spawn and for respawns. active_workers is not reliable
+  // after SIGKILL.
+  if (worker_ready_flags) { worker_ready_flags[worker_id].store(true, std::memory_order_release); }
+
+  shm_ctrl->active_workers++;
+  auto last_idle_probe = std::chrono::steady_clock::now();
+
+  while (!shm_ctrl->shutdown_requested) {
+    int job_slot = claim_job_slot(worker_id);
+    if (job_slot < 0) {
+      auto now = std::chrono::steady_clock::now();
+      if (now - last_idle_probe >= gpu_health_idle_interval()) {
+        if (!probe_worker_gpu_liveness(worker_id, GpuProbeReason::IDLE)) {
+          exit_gpu_unhealthy(worker_id, "idle probe");
+        }
+        last_idle_probe = now;
+      }
+      usleep(10000);
+      continue;
+    }
+
+    JobQueueEntry& job = job_queue[job_slot];
+    std::string job_id(job.job_id);
+    uint32_t problem_category = job.problem_category;
+
+    if (!probe_worker_gpu_liveness(worker_id, GpuProbeReason::BEFORE_JOB)) {
+      exit_gpu_unhealthy(worker_id, "pre-job probe");
+    }
+    last_idle_probe = std::chrono::steady_clock::now();
+
+    if (job.cancelled) {
+      SERVER_LOG_INFO("[Worker %d] Job cancelled before processing: %s", worker_id, job_id.c_str());
+      store_simple_result(job_id, worker_id, RESULT_CANCELLED, "Job was cancelled");
+      reset_job_slot(job);
+      continue;
+    }
+
+    SERVER_LOG_INFO("[Worker %d] Processing job: %s (type: %s)",
+                    worker_id,
+                    job_id.c_str(),
+                    problem_category == cuopt::remote::MIP
+                      ? "MIP"
+                      : (problem_category == cuopt::remote::VRP ? "VRP" : "LP"));
+
+    DeserializedJob deserialized;
+    read_problem_from_pipe(worker_id, job, deserialized);
+    if (!deserialized.success) {
+      SERVER_LOG_ERROR("[Worker %d] Failed to read job data from pipe", worker_id);
+      store_simple_result(job_id,
+                          worker_id,
+                          RESULT_ERROR,
+                          deserialized.error_message.empty() ? "Failed to read job data"
+                                                             : deserialized.error_message.c_str());
+      reset_job_slot(job);
+      continue;
+    }
+
+    if (deserialized.is_vrp || problem_category == cuopt::remote::VRP) {
+#ifdef CUOPT_ENABLE_GRPC_ROUTING
+      SERVER_LOG_INFO("[Worker] VRP problem reconstructed: %d locations, %d vehicles, %d orders",
+                      deserialized.routing_problem.num_locations,
+                      deserialized.routing_problem.fleet_size,
+                      deserialized.routing_problem.num_orders < 0
+                        ? deserialized.routing_problem.num_locations
+                        : deserialized.routing_problem.num_orders);
+#endif
+    } else {
+      SERVER_LOG_INFO("[Worker] Problem reconstructed: %d constraints, %d variables, %d nonzeros",
+                      deserialized.problem.get_n_constraints(),
+                      deserialized.problem.get_n_variables(),
+                      deserialized.problem.get_nnz());
+    }
+
+    std::string log_file = get_log_file_path(job_id);
+    raft::handle_t handle;
+
+    SolveResult result;
+    if (problem_category == cuopt::remote::VRP || deserialized.is_vrp) {
+      result = run_vrp_solve(deserialized, handle);
+    } else if (problem_category == cuopt::remote::MIP) {
+      result = run_mip_solve(deserialized, handle, log_file, job_id, worker_id);
+    } else {
+      result = run_lp_solve(deserialized, handle, log_file);
+    }
+
+    publish_result(result, job_id, worker_id);
+    reset_job_slot(job);
+
+    SERVER_LOG_INFO("[Worker %d] Completed job: %s (success: %d)",
+                    worker_id,
+                    job_id.c_str(),
+                    static_cast<int>(result.success));
+  }
+
+  shm_ctrl->active_workers--;
+  SERVER_LOG_INFO("[Worker %d] Stopped", worker_id);
+  // _exit() skips atexit handlers registered by CUDA, RMM, and the logger.
+  _exit(0);
+}
+
+#endif  // CUOPT_ENABLE_GRPC

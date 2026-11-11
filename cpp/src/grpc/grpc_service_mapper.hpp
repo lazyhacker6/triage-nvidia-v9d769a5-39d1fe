@@ -1,0 +1,131 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include <cuopt_remote.pb.h>
+#include <cuopt_remote_service.pb.h>
+
+#include <string>
+
+namespace cuopt::mathematical_optimization {
+
+// Forward declarations
+template <typename i_t, typename f_t>
+class cpu_optimization_problem_t;
+
+template <typename i_t, typename f_t>
+class solver_settings_t;
+
+/**
+ * @brief Build a gRPC SubmitJobRequest for an LP problem.
+ *
+ * Warm start is written from get_pdlp_settings(). Every set_parameter() value
+ * is written into settings.parameters and not as a deprecated typed field.
+ * A server from before the parameter map cannot apply this request.
+ */
+template <typename i_t, typename f_t>
+cuopt::remote::SubmitJobRequest build_lp_submit_request(
+  const cpu_optimization_problem_t<i_t, f_t>& cpu_problem, solver_settings_t<i_t, f_t>& settings);
+
+/**
+ * @brief Build a gRPC SubmitJobRequest for a MIP problem.
+ *
+ * presolve_absolute_tolerance is written from get_mip_settings(). Every
+ * set_parameter() value is written into settings.parameters and not as a
+ * deprecated typed field. A server from before the parameter map cannot
+ * apply this request.
+ */
+template <typename i_t, typename f_t>
+cuopt::remote::SubmitJobRequest build_mip_submit_request(
+  const cpu_optimization_problem_t<i_t, f_t>& cpu_problem,
+  solver_settings_t<i_t, f_t>& settings,
+  bool enable_incumbents    = false,
+  bool enable_set_incumbent = false);
+
+/**
+ * @brief Build the unified chunked-upload header for an LP problem.
+ *
+ * Same request as build_lp_submit_request, with problem arrays left empty.
+ * Array payloads are sent separately as ArrayChunks.
+ */
+template <typename i_t, typename f_t>
+cuopt::remote::SubmitJobRequest build_chunked_lp_submit_request(
+  const cpu_optimization_problem_t<i_t, f_t>& cpu_problem, solver_settings_t<i_t, f_t>& settings);
+
+/**
+ * @brief Build the unified chunked-upload header for a MIP problem.
+ *
+ * Same request as build_mip_submit_request, with problem arrays left empty.
+ * Array payloads are sent separately as ArrayChunks.
+ */
+template <typename i_t, typename f_t>
+cuopt::remote::SubmitJobRequest build_chunked_mip_submit_request(
+  const cpu_optimization_problem_t<i_t, f_t>& cpu_problem,
+  solver_settings_t<i_t, f_t>& settings,
+  bool enable_incumbents    = false,
+  bool enable_set_incumbent = false);
+
+/**
+ * @brief Build a gRPC StatusRequest.
+ *
+ * Simple helper to create a status check request.
+ *
+ * @param job_id The job ID to check status for
+ * @return StatusRequest protobuf message
+ */
+inline cuopt::remote::StatusRequest build_status_request(const std::string& job_id)
+{
+  cuopt::remote::StatusRequest request;
+  request.set_job_id(job_id);
+  return request;
+}
+
+/**
+ * @brief Build a gRPC GetResultRequest.
+ *
+ * Simple helper to create a result retrieval request.
+ *
+ * @param job_id The job ID to get results for
+ * @return GetResultRequest protobuf message
+ */
+inline cuopt::remote::GetResultRequest build_get_result_request(const std::string& job_id)
+{
+  cuopt::remote::GetResultRequest request;
+  request.set_job_id(job_id);
+  return request;
+}
+
+/**
+ * @brief Build a gRPC CancelRequest.
+ *
+ * Simple helper to create a job cancellation request.
+ *
+ * @param job_id The job ID to cancel
+ * @return CancelRequest protobuf message
+ */
+inline cuopt::remote::CancelRequest build_cancel_request(const std::string& job_id)
+{
+  cuopt::remote::CancelRequest request;
+  request.set_job_id(job_id);
+  return request;
+}
+
+/**
+ * @brief Build a gRPC DeleteRequest.
+ *
+ * Simple helper to create a result deletion request.
+ *
+ * @param job_id The job ID whose result should be deleted
+ * @return DeleteRequest protobuf message
+ */
+inline cuopt::remote::DeleteRequest build_delete_request(const std::string& job_id)
+{
+  cuopt::remote::DeleteRequest request;
+  request.set_job_id(job_id);
+  return request;
+}
+
+}  // namespace cuopt::mathematical_optimization

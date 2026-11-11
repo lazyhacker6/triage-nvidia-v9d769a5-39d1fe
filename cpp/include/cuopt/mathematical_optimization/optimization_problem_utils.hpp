@@ -1,0 +1,430 @@
+/* clang-format off */
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/* clang-format on */
+
+#pragma once
+
+#include <cuopt/error.hpp>
+#include <cuopt/mathematical_optimization/cpu_optimization_problem.hpp>
+#include <cuopt/mathematical_optimization/cpu_pdlp_warm_start_data.hpp>
+#include <cuopt/mathematical_optimization/io/data_model_view.hpp>
+#include <cuopt/mathematical_optimization/io/mps_data_model.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem_interface.hpp>
+#include <cuopt/mathematical_optimization/solver_settings.hpp>
+
+#include <limits>
+#include <span>
+#include <vector>
+
+namespace cuopt::mathematical_optimization {
+
+inline constexpr bool is_valid_public_var_type_code(char variable_type)
+{
+  return variable_type == 'C' || variable_type == 'I' || variable_type == 'S';
+}
+
+inline constexpr var_t char_to_var_type(char variable_type)
+{
+  if (variable_type == 'I' || variable_type == 'B') { return var_t::INTEGER; }
+  if (variable_type == 'S') { return var_t::SEMI_CONTINUOUS; }
+  return var_t::CONTINUOUS;
+}
+
+inline constexpr char var_type_to_char(var_t variable_type)
+{
+  if (variable_type == var_t::INTEGER) { return 'I'; }
+  if (variable_type == var_t::SEMI_CONTINUOUS) { return 'S'; }
+  return 'C';
+}
+
+// Fill ranged constraint bounds from row_types + a single RHS when the ranged
+// pair was not supplied. No-op when either ranged vector is already populated.
+template <typename i_t, typename f_t>
+void expand_rhs(io::mps_data_model_t<i_t, f_t> const& mps,
+                std::vector<f_t>& constr_lb,
+                std::vector<f_t>& constr_ub)
+{
+  if (!constr_lb.empty() || !constr_ub.empty()) { return; }
+  const auto& row_types         = mps.get_row_types();
+  const auto& constraint_bounds = mps.get_constraint_bounds();
+  constr_lb.reserve(row_types.size());
+  constr_ub.reserve(row_types.size());
+  for (size_t i = 0; i < row_types.size(); ++i) {
+    if (row_types[i] == 'L') {
+      constr_lb.push_back(-std::numeric_limits<f_t>::infinity());
+      constr_ub.push_back(constraint_bounds[i]);
+    } else if (row_types[i] == 'G') {
+      constr_lb.push_back(constraint_bounds[i]);
+      constr_ub.push_back(std::numeric_limits<f_t>::infinity());
+    } else if (row_types[i] == 'E') {
+      constr_lb.push_back(constraint_bounds[i]);
+      constr_ub.push_back(constraint_bounds[i]);
+    }
+  }
+}
+
+/**
+ * @brief Copy optional initial primal/dual arrays onto a CPU problem.
+ *
+ * No-op when both spans are empty, or when @p problem is not a
+ * cpu_optimization_problem_t (GPU problems do not store these host arrays).
+ */
+template <typename i_t, typename f_t>
+void copy_initial_solutions_to_cpu_problem(optimization_problem_interface_t<i_t, f_t>* problem,
+                                           std::span<const f_t> primal,
+                                           std::span<const f_t> dual)
+{
+  if (primal.empty() && dual.empty()) { return; }
+  auto* cpu_problem = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem);
+  if (cpu_problem == nullptr) { return; }
+  if (!primal.empty()) { cpu_problem->set_initial_primal_solution(primal); }
+  if (!dual.empty()) { cpu_problem->set_initial_dual_solution(dual); }
+}
+
+/**
+ * @brief If the CPU problem has an initial primal, copy it onto MIP settings.
+ *
+ * Same contract as local solve: empty means unset; size/finiteness are left to
+ * add_initial_solution / problem_checking_t.
+ */
+template <typename i_t, typename f_t>
+void apply_initial_solutions_to_mip_settings(const cpu_optimization_problem_t<i_t, f_t>& problem,
+                                             mip_solver_settings_t<i_t, f_t>& settings)
+{
+  const auto primal = problem.get_initial_primal_solution_host();
+  if (!primal.empty()) {
+    settings.add_initial_solution(primal.data(), static_cast<i_t>(primal.size()));
+  }
+}
+
+/**
+ * @brief If the CPU problem has initial primal/dual arrays, copy them onto PDLP settings.
+ *
+ * Each array is applied independently when non-empty, matching local Solve.
+ */
+template <typename i_t, typename f_t>
+void apply_initial_solutions_to_pdlp_settings(const cpu_optimization_problem_t<i_t, f_t>& problem,
+                                              pdlp_solver_settings_t<i_t, f_t>& settings)
+{
+  const auto primal = problem.get_initial_primal_solution_host();
+  if (!primal.empty()) {
+    settings.set_initial_primal_solution(primal.data(), static_cast<i_t>(primal.size()));
+  }
+  const auto dual = problem.get_initial_dual_solution_host();
+  if (!dual.empty()) {
+    settings.set_initial_dual_solution(dual.data(), static_cast<i_t>(dual.size()));
+  }
+}
+
+/**
+ * @brief Helper function to populate optimization_problem_interface_t from mps_data_model_t
+ *
+ * This avoids creating a temporary optimization_problem_t which requires GPU memory allocation.
+ * Instead, it directly populates the interface which can use either CPU or GPU memory.
+ *
+ * @tparam i_t Integer type for indices
+ * @tparam f_t Floating point type for values
+ * @param[out] problem The optimization problem interface to populate
+ * @param[in] data_model The MPS data model containing the problem data
+ */
+template <typename i_t, typename f_t>
+void populate_from_mps_data_model(optimization_problem_interface_t<i_t, f_t>* problem,
+                                  const io::mps_data_model_t<i_t, f_t>& data_model)
+{
+  // Set scalar values
+  problem->set_maximize(data_model.get_sense());
+  problem->set_objective_scaling_factor(data_model.get_objective_scaling_factor());
+  problem->set_objective_offset(data_model.get_objective_offset());
+
+  // Set string values
+  if (!data_model.get_objective_name().empty())
+    problem->set_objective_name(data_model.get_objective_name());
+  if (!data_model.get_problem_name().empty())
+    problem->set_problem_name(data_model.get_problem_name());
+  if (!data_model.get_variable_names().empty())
+    problem->set_variable_names(data_model.get_variable_names());
+  if (!data_model.get_row_names().empty()) problem->set_row_names(data_model.get_row_names());
+
+  // Set array values
+  i_t n_vars        = data_model.get_n_variables();
+  i_t n_constraints = data_model.get_n_constraints();
+
+  const auto& obj_coeffs = data_model.get_objective_coefficients();
+  if (!obj_coeffs.empty()) { problem->set_objective_coefficients(obj_coeffs.data(), n_vars); }
+
+  const auto& A_offsets = data_model.get_constraint_matrix_offsets();
+  if (!A_offsets.empty() && A_offsets.size() > static_cast<size_t>(n_constraints)) {
+    i_t n_nonzeros = A_offsets[n_constraints];
+    if (n_nonzeros > 0) {
+      problem->set_csr_constraint_matrix(data_model.get_constraint_matrix_values().data(),
+                                         n_nonzeros,
+                                         data_model.get_constraint_matrix_indices().data(),
+                                         n_nonzeros,
+                                         A_offsets.data(),
+                                         n_constraints + 1);
+    } else {
+      // Set empty constraint matrix
+      std::vector<i_t> offsets(1, 0);
+      problem->set_csr_constraint_matrix(nullptr, 0, nullptr, 0, offsets.data(), 1);
+    }
+  }
+
+  const auto& con_bounds = data_model.get_constraint_bounds();
+  if (!con_bounds.empty()) { problem->set_constraint_bounds(con_bounds.data(), n_constraints); }
+  const auto& con_lb = data_model.get_constraint_lower_bounds();
+  if (!con_lb.empty()) { problem->set_constraint_lower_bounds(con_lb.data(), n_constraints); }
+
+  const auto& con_ub = data_model.get_constraint_upper_bounds();
+  if (!con_ub.empty()) { problem->set_constraint_upper_bounds(con_ub.data(), n_constraints); }
+
+  const auto& row_types = data_model.get_row_types();
+  if (!row_types.empty()) { problem->set_row_types(row_types.data(), n_constraints); }
+
+  const auto& var_lb = data_model.get_variable_lower_bounds();
+  if (!var_lb.empty()) { problem->set_variable_lower_bounds(var_lb.data(), n_vars); }
+
+  const auto& var_ub = data_model.get_variable_upper_bounds();
+  if (!var_ub.empty()) { problem->set_variable_upper_bounds(var_ub.data(), n_vars); }
+
+  // Convert variable types from char to enum
+  const auto& char_variable_types = data_model.get_variable_types();
+  if (!char_variable_types.empty()) {
+    std::vector<var_t> enum_variable_types(char_variable_types.size());
+    for (size_t i = 0; i < char_variable_types.size(); ++i) {
+      enum_variable_types[i] = char_to_var_type(char_variable_types[i]);
+    }
+    problem->set_variable_types(enum_variable_types.data(), enum_variable_types.size());
+    // Problem category (LP/MIP/IP) is auto-detected by set_variable_types
+  }
+
+  // Handle quadratic objective if present
+  if (data_model.has_quadratic_objective()) {
+    auto& q_offsets = data_model.get_quadratic_objective_offsets();
+    cuopt_expects(q_offsets.size() >= static_cast<size_t>(n_vars + 1),
+                  error_type_t::ValidationError,
+                  "Quadratic objective offsets vector too small for number of variables");
+    i_t q_nonzeros = q_offsets[n_vars];
+    problem->set_quadratic_objective_matrix(data_model.get_quadratic_objective_values().data(),
+                                            q_nonzeros,
+                                            data_model.get_quadratic_objective_indices().data(),
+                                            q_nonzeros,
+                                            q_offsets.data(),
+                                            n_vars + 1);
+  }
+  // Quadratic constraints from mps_data_model are already canonical (append_quadratic_constraint).
+  if (data_model.has_quadratic_constraints()) {
+    problem->set_quadratic_constraints(data_model.get_quadratic_constraints());
+  }
+
+  copy_initial_solutions_to_cpu_problem(
+    problem,
+    std::span<const f_t>{data_model.get_initial_primal_solution()},
+    std::span<const f_t>{data_model.get_initial_dual_solution()});
+}
+
+/**
+ * @brief Copy warm-start data into the form a GPU solve needs (H2D / view->device_uvector).
+ *
+ * Declared here, defined in libcuopt (optimization_problem.cu): it touches device memory,
+ * so keeping it out-of-line is what lets CUDA-free consumers of this header link without
+ * a CUDA runtime. Only call it with a real handle.
+ */
+template <typename i_t, typename f_t>
+void copy_warmstart_data_to_device(solver_settings_t<i_t, f_t>& solver_settings,
+                                   const raft::handle_t* handle);
+
+/**
+ * @brief Copy warm-start data into the form a CPU / remote solve needs, including a
+ * device-to-host copy when the warm start is device-resident.
+ *
+ * Declared here, defined in libcuopt (optimization_problem.cu). This is the null-handle
+ * path for a normal (non host-only) caller: it has a device, so its settings may hold
+ * device_uvector-backed warm start that must be brought to host before a remote solve.
+ */
+template <typename i_t, typename f_t>
+void copy_warmstart_data_to_host(solver_settings_t<i_t, f_t>& solver_settings);
+
+/**
+ * @brief Copy a host-span warm-start view into the form a CPU / remote solve needs.
+ *
+ * Handles the two cases reachable without a device: warm start already in host form
+ * (nothing to do), and a warm-start view over host spans (copy it).
+ *
+ * Deliberately does NOT handle device-resident warm start -- that needs a D2H copy and
+ * therefore CUDA. Callers that might be holding device data must use
+ * copy_warmstart_data_to_host() instead; only a kHostOnly caller, which by construction
+ * has no device to have populated it, may use this one.
+ */
+template <typename i_t, typename f_t>
+void copy_warmstart_view_to_host(solver_settings_t<i_t, f_t>& solver_settings)
+{
+  auto& pdlp = solver_settings.get_pdlp_settings();
+
+  if (pdlp.get_cpu_pdlp_warm_start_data().is_populated()) { return; }
+
+  // Warmstart view (host spans from Cython) -> CPU backend: copy directly, no CUDA needed.
+  if (solver_settings.get_pdlp_warm_start_data_view()
+        .last_restart_duality_gap_dual_solution_.size() > 0) {
+    pdlp.get_cpu_pdlp_warm_start_data() =
+      cpu_pdlp_warm_start_data_t<i_t, f_t>(solver_settings.get_pdlp_warm_start_data_view());
+  }
+}
+
+/**
+ * @brief Transfer parsed MPS/QPS storage into a CPU-backed problem without copying payload arrays.
+ *
+ * For GPU-backed problems this falls back to populate_from_mps_data_model (copy/H2D path), waits
+ * for the copies to complete, and releases the parsed host storage.
+ *
+ * @tparam i_t Integer type for indices
+ * @tparam f_t Floating point type for values
+ * @param[out] problem The optimization problem interface to populate
+ * @param[in] data_model Parsed model; moved-from on return
+ */
+template <typename i_t, typename f_t>
+void adopt_from_mps_data_model(optimization_problem_interface_t<i_t, f_t>* problem,
+                               io::mps_data_model_t<i_t, f_t>&& data_model)
+{
+  if (auto* cpu_problem = dynamic_cast<cpu_optimization_problem_t<i_t, f_t>*>(problem)) {
+    cpu_problem->adopt_from_mps_data_model(std::move(data_model));
+    return;
+  }
+  populate_from_mps_data_model(problem, data_model);
+  if (auto* gpu_problem = dynamic_cast<optimization_problem_t<i_t, f_t>*>(problem)) {
+    gpu_problem->get_handle_ptr()->sync_stream();
+    data_model = {};
+  }
+}
+
+/**
+ * @brief Helper function to populate optimization_problem_interface_t from data_model_view_t
+ *
+ * This is used by the Python Cython interface which provides data_model_view_t.
+ * Similar to populate_from_mps_data_model but works with data_model_view_t instead.
+ *
+ * @tparam i_t Integer type for indices
+ * @tparam f_t Floating point type for values
+ * @param[out] problem The optimization problem interface to populate
+ * @param[in] data_model The data model view containing the problem data
+ * @param[in] solver_settings Optional solver settings (for warmstart data, GPU only)
+ * @param[in] handle Optional RAFT handle (for warmstart data, GPU only)
+ */
+template <typename i_t, typename f_t, bool kHostOnly = false>
+void populate_from_data_model_view(
+  optimization_problem_interface_t<i_t, f_t>* problem,
+  cuopt::mathematical_optimization::io::data_model_view_t<i_t, f_t>* data_model,
+  solver_settings_t<i_t, f_t>* solver_settings = nullptr,
+  const raft::handle_t* handle                 = nullptr)
+{
+  problem->set_maximize(data_model->get_sense());
+
+  if (data_model->get_constraint_matrix_values().size() != 0 &&
+      data_model->get_constraint_matrix_indices().size() != 0 &&
+      data_model->get_constraint_matrix_offsets().size() != 0) {
+    problem->set_csr_constraint_matrix(data_model->get_constraint_matrix_values().data(),
+                                       data_model->get_constraint_matrix_values().size(),
+                                       data_model->get_constraint_matrix_indices().data(),
+                                       data_model->get_constraint_matrix_indices().size(),
+                                       data_model->get_constraint_matrix_offsets().data(),
+                                       data_model->get_constraint_matrix_offsets().size());
+  }
+
+  if (data_model->get_constraint_bounds().size() != 0) {
+    problem->set_constraint_bounds(data_model->get_constraint_bounds().data(),
+                                   data_model->get_constraint_bounds().size());
+  }
+
+  if (data_model->get_objective_coefficients().size() != 0) {
+    problem->set_objective_coefficients(data_model->get_objective_coefficients().data(),
+                                        data_model->get_objective_coefficients().size());
+  }
+
+  problem->set_objective_scaling_factor(data_model->get_objective_scaling_factor());
+  problem->set_objective_offset(data_model->get_objective_offset());
+
+  // `if constexpr`, not a runtime branch: a kHostOnly caller never *instantiates* the GPU
+  // helper, so it emits no reference to it and needs no CUDA runtime to link.
+  if (solver_settings != nullptr) {
+    if constexpr (kHostOnly) {
+      copy_warmstart_view_to_host(*solver_settings);
+    } else {
+      if (handle != nullptr) {
+        copy_warmstart_data_to_device(*solver_settings, handle);
+      } else {
+        // No handle, but this caller has a device: the warm start may be device-resident,
+        // so it needs the variant that can copy it back to host.
+        copy_warmstart_data_to_host(*solver_settings);
+      }
+    }
+  }
+
+  if (data_model->get_quadratic_objective_values().size() != 0 &&
+      data_model->get_quadratic_objective_indices().size() != 0 &&
+      data_model->get_quadratic_objective_offsets().size() != 0) {
+    problem->set_quadratic_objective_matrix(data_model->get_quadratic_objective_values().data(),
+                                            data_model->get_quadratic_objective_values().size(),
+                                            data_model->get_quadratic_objective_indices().data(),
+                                            data_model->get_quadratic_objective_indices().size(),
+                                            data_model->get_quadratic_objective_offsets().data(),
+                                            data_model->get_quadratic_objective_offsets().size());
+  }
+
+  if (data_model->get_variable_lower_bounds().size() != 0) {
+    problem->set_variable_lower_bounds(data_model->get_variable_lower_bounds().data(),
+                                       data_model->get_variable_lower_bounds().size());
+  }
+
+  if (data_model->get_variable_upper_bounds().size() != 0) {
+    problem->set_variable_upper_bounds(data_model->get_variable_upper_bounds().data(),
+                                       data_model->get_variable_upper_bounds().size());
+  }
+
+  if (data_model->get_row_types().size() != 0) {
+    problem->set_row_types(data_model->get_row_types().data(), data_model->get_row_types().size());
+  }
+
+  if (data_model->get_constraint_lower_bounds().size() != 0) {
+    problem->set_constraint_lower_bounds(data_model->get_constraint_lower_bounds().data(),
+                                         data_model->get_constraint_lower_bounds().size());
+  }
+
+  if (data_model->get_constraint_upper_bounds().size() != 0) {
+    problem->set_constraint_upper_bounds(data_model->get_constraint_upper_bounds().data(),
+                                         data_model->get_constraint_upper_bounds().size());
+  }
+
+  if (data_model->get_variable_types().size() != 0) {
+    std::vector<var_t> enum_variable_types(data_model->get_variable_types().size());
+    std::transform(
+      data_model->get_variable_types().data(),
+      data_model->get_variable_types().data() + data_model->get_variable_types().size(),
+      enum_variable_types.begin(),
+      char_to_var_type);
+    problem->set_variable_types(enum_variable_types.data(), enum_variable_types.size());
+    // Problem category (LP/MIP/IP) is auto-detected by set_variable_types
+  }
+
+  if (data_model->get_variable_names().size() != 0) {
+    problem->set_variable_names(data_model->get_variable_names());
+  }
+
+  if (data_model->get_row_names().size() != 0) {
+    problem->set_row_names(data_model->get_row_names());
+  }
+
+  // Raw Q COO from data_model_view is canonicalized here before solver storage.
+  if (data_model->has_quadratic_constraints()) {
+    auto qcs = data_model->get_quadratic_constraints();
+    io::canonicalize_quadratic_constraints<i_t, f_t>(qcs);
+    problem->set_quadratic_constraints(std::move(qcs));
+  }
+
+  copy_initial_solutions_to_cpu_problem(
+    problem, data_model->get_initial_primal_solution(), data_model->get_initial_dual_solution());
+}
+
+}  // namespace cuopt::mathematical_optimization

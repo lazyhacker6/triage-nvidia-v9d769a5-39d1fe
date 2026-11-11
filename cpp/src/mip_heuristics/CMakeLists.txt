@@ -1,0 +1,78 @@
+# cmake-format: off
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# cmake-format: on
+
+
+# Files necessary for Linear Programming functionality
+set(MIP_LP_NECESSARY_FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/problem/problem.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/problem/presolve_data.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/solver_settings.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/solver_solution.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/local_search/rounding/simple_rounding.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/solution/solution.cu
+)
+
+# Files that are MIP-specific and not needed for pure LP
+set(MIP_NON_LP_FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/mip_scaling_strategy.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/solve.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/solver.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/diversity/assignment_hash_map.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/diversity/diversity_manager.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/diversity/multi_armed_bandit.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/diversity/population.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/relaxed_lp/relaxed_lp.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/local_search/local_search.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/local_search/rounding/bounds_repair.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/local_search/rounding/constraint_prop.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/local_search/rounding/simple_rounding.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/local_search/feasibility_pump/feasibility_pump.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/local_search/line_segment_search/line_segment_search.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/feasibility_jump.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/feasibility_jump_kernels.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/audit.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/climber.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/loop.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/portfolio.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/search/escape.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/search/fp.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/starts/affine.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/starts/cardinality.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/starts/chain.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/starts/covering.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/starts/network.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/starts/pmedian.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/setup/bounds.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/setup/lp.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/cpu/setup/structure.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/fj_cpu_bridge.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/fj_cpu_binary.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/fj_cpu_binary_preprocess.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/sat/cdcl_sat.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/fj_cpu_binary_kernels.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/early_cpufj.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/feasibility_jump/early_gpufj.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/structural/early_structural.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/structural/arc_flow.cu)
+
+# Choose which files to include based on build mode
+if(BUILD_LP_ONLY)
+  set(MIP_SRC_FILES ${MIP_LP_NECESSARY_FILES})
+else()
+  set(MIP_SRC_FILES ${MIP_LP_NECESSARY_FILES} ${MIP_NON_LP_FILES})
+endif()
+
+set(MIP_SRC_FILES ${MIP_SRC_FILES} PARENT_SCOPE)
+
+# Host-only members of mip_solver_settings_t (callbacks, tolerances). The gRPC client
+# needs them, so they build into cuopt_client; add_initial_solution stays in the .cu.
+set(MIP_CLIENT_SRC_FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/solver_settings.cpp
+)
+
+set(CUOPT_SRC_FILES ${CUOPT_SRC_FILES}
+  ${MIP_SRC_FILES} PARENT_SCOPE)
+set(CUOPT_CLIENT_SRC_FILES ${CUOPT_CLIENT_SRC_FILES}
+  ${MIP_CLIENT_SRC_FILES} PARENT_SCOPE)

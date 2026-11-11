@@ -1,0 +1,360 @@
+/* clang-format off */
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/* clang-format on */
+
+#include <cstdio>
+
+#include <utilities/common_utils.hpp>
+#include <utilities/copy_helpers.hpp>
+
+#include <gtest/gtest.h>
+
+#include <cuopt/mathematical_optimization/constants.h>
+#include <cuopt/mathematical_optimization/pdlp/solver_settings.hpp>
+#include <cuopt/mathematical_optimization/solve.hpp>
+#include <dual_simplex/presolve.hpp>
+#include <dual_simplex/scaling.hpp>
+#include <dual_simplex/solve.hpp>
+#include <dual_simplex/user_problem.hpp>
+#include <math_optimization/tic_toc.hpp>
+
+#include <raft/sparse/detail/cusparse_wrappers.h>
+#include <raft/core/cusparse_macros.hpp>
+
+#include <cuopt/mathematical_optimization/io/parser.hpp>
+#include <utilities/logger.hpp>
+
+namespace cuopt::mathematical_optimization::simplex::test {
+
+// This serves as both a warm up but also a mandatory initial call to setup cuSparse and cuBLAS
+static void init_handler(const raft::handle_t* handle_ptr)
+{
+  // Init cuBlas / cuSparse context here to avoid having it during solving time
+  RAFT_CUBLAS_TRY(raft::linalg::detail::cublassetpointermode(
+    handle_ptr->get_cublas_handle(), CUBLAS_POINTER_MODE_DEVICE, handle_ptr->get_stream().get()));
+  RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsesetpointermode(handle_ptr->get_cusparse_handle(),
+                                                                 CUSPARSE_POINTER_MODE_DEVICE,
+                                                                 handle_ptr->get_stream().get()));
+}
+
+TEST(barrier, chess_set)
+{
+  cuopt::init_logger_t log("", true);
+  namespace simplex = cuopt::mathematical_optimization::simplex;
+  raft::handle_t handle{};
+  init_handler(&handle);
+  simplex::user_problem_t<int, double> user_problem(&handle);
+  // maximize   5*xs + 20*xl
+  // subject to  1*xs +  3*xl <= 200
+  //             3*xs +  2*xl <= 160
+  constexpr int m  = 2;
+  constexpr int n  = 2;
+  constexpr int nz = 4;
+
+  user_problem.num_rows = m;
+  user_problem.num_cols = n;
+  user_problem.objective.resize(n);
+  user_problem.objective[0] = -5;
+  user_problem.objective[1] = -20;
+  user_problem.A.m          = m;
+  user_problem.A.n          = n;
+  user_problem.A.nz_max     = nz;
+  user_problem.A.reallocate(nz);
+  user_problem.A.col_start.resize(n + 1);
+  user_problem.A.col_start[0] = 0;
+  user_problem.A.col_start[1] = 2;
+  user_problem.A.col_start[2] = 4;
+  user_problem.A.i[0]         = 0;
+  user_problem.A.x[0]         = 1.0;
+  user_problem.A.i[1]         = 1;
+  user_problem.A.x[1]         = 3.0;
+  user_problem.A.i[2]         = 0;
+  user_problem.A.x[2]         = 3.0;
+  user_problem.A.i[3]         = 1;
+  user_problem.A.x[3]         = 2.0;
+  user_problem.rhs.resize(m);
+  user_problem.rhs[0] = 200;
+  user_problem.rhs[1] = 160;
+  user_problem.row_sense.resize(m);
+  user_problem.row_sense[0] = 'L';
+  user_problem.row_sense[1] = 'L';
+  user_problem.lower.resize(n);
+  user_problem.lower[0] = 0;
+  user_problem.lower[1] = 0.0;
+  user_problem.upper.resize(n);
+  user_problem.upper[0]       = inf;
+  user_problem.upper[1]       = inf;
+  user_problem.num_range_rows = 0;
+  user_problem.problem_name   = "chess set";
+  user_problem.row_names.resize(m);
+  user_problem.row_names[0] = "boxwood";
+  user_problem.row_names[1] = "lathe hours";
+  user_problem.col_names.resize(n);
+  user_problem.col_names[0] = "xs";
+  user_problem.col_names[1] = "xl";
+  user_problem.obj_constant = 0.0;
+  user_problem.var_types.resize(n);
+  user_problem.var_types[0] = simplex::variable_type_t::CONTINUOUS;
+  user_problem.var_types[1] = simplex::variable_type_t::CONTINUOUS;
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  simplex::lp_solution_t<int, double> solution(user_problem.num_rows, user_problem.num_cols);
+  EXPECT_EQ((simplex::solve_linear_program_with_barrier(user_problem, settings, solution)),
+            simplex::lp_status_t::OPTIMAL);
+  const double objective = -solution.objective;
+  EXPECT_NEAR(objective, 1333.33, 1e-2);
+  EXPECT_NEAR(solution.x[0], 0.0, 1e-6);
+  EXPECT_NEAR(solution.x[1], 66.6667, 1e-3);
+}
+
+TEST(barrier, dual_variable_greater_than)
+{
+  cuopt::init_logger_t log("", true);
+  // minimize   3*x0 + 2 * x1
+  // subject to  x0 + x1  >= 1
+  //             x0 + 2x1 >= 3
+  //             x0, x1 >= 0
+
+  raft::handle_t handle{};
+  init_handler(&handle);
+  cuopt::mathematical_optimization::simplex::user_problem_t<int, double> user_problem(&handle);
+  constexpr int m  = 2;
+  constexpr int n  = 2;
+  constexpr int nz = 4;
+
+  user_problem.num_rows = m;
+  user_problem.num_cols = n;
+  user_problem.objective.resize(n);
+  user_problem.objective[0] = 3.0;
+  user_problem.objective[1] = 2.0;
+  user_problem.A.m          = m;
+  user_problem.A.n          = n;
+  user_problem.A.nz_max     = nz;
+  user_problem.A.reallocate(nz);
+  user_problem.A.col_start.resize(n + 1);
+  user_problem.A.col_start[0] = 0;  // x0 start
+  user_problem.A.col_start[1] = 2;
+  user_problem.A.col_start[2] = 4;
+
+  int nnz                 = 0;
+  user_problem.A.i[nnz]   = 0;
+  user_problem.A.x[nnz++] = 1.0;
+  user_problem.A.i[nnz]   = 1;
+  user_problem.A.x[nnz++] = 1.0;
+  user_problem.A.i[nnz]   = 0;
+  user_problem.A.x[nnz++] = 1.0;
+  user_problem.A.i[nnz]   = 1;
+  user_problem.A.x[nnz++] = 2.0;
+  user_problem.A.print_matrix();
+  EXPECT_EQ(nnz, nz);
+
+  user_problem.rhs.resize(m);
+  user_problem.rhs[0] = 1.0;
+  user_problem.rhs[1] = 3.0;
+
+  user_problem.row_sense.resize(m);
+  user_problem.row_sense[0] = 'G';
+  user_problem.row_sense[1] = 'G';
+
+  user_problem.lower.resize(n);
+  user_problem.lower[0] = 0.0;
+  user_problem.lower[1] = 0.0;
+
+  user_problem.upper.resize(n);
+  user_problem.upper[0] = inf;
+  user_problem.upper[1] = inf;
+
+  user_problem.num_range_rows = 0;
+  user_problem.problem_name   = "dual_variable_greater_than";
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  simplex::lp_solution_t<int, double> solution(user_problem.num_rows, user_problem.num_cols);
+  EXPECT_EQ((simplex::solve_linear_program_with_barrier(user_problem, settings, solution)),
+            simplex::lp_status_t::OPTIMAL);
+  EXPECT_NEAR(solution.objective, 3.0, 1e-5);
+  EXPECT_NEAR(solution.x[0], 0.0, 1e-5);
+  EXPECT_NEAR(solution.x[1], 1.5, 1e-5);
+  EXPECT_NEAR(solution.y[0], 0.0, 1e-5);
+  EXPECT_NEAR(solution.y[1], 1.0, 1e-5);
+  EXPECT_NEAR(solution.z[0], 2.0, 1e-5);
+  EXPECT_NEAR(solution.z[1], 0.0, 1e-5);
+}
+
+TEST(barrier, min_x_squared_free_variable_dual_correction)
+{
+  // minimize   x^2         (Q = [2.0], so 0.5 * x^T Q x = x^2)
+  // subject to x >= 1
+  // x is free
+  //
+  // Optimal: x = 1, obj = 1, y[0] = 2, z[0] = 0
+  // This tests the dual correction for originally-free variables that
+  // received implied bounds during presolve.
+
+  const raft::handle_t handle{};
+  init_handler(&handle);
+
+  auto path =
+    cuopt::test::get_rapids_dataset_root_dir() + "/quadratic_programming/min_x_squared.mps";
+  auto mps_data = cuopt::mathematical_optimization::io::read_mps<int, double>(path);
+
+  auto settings = cuopt::mathematical_optimization::pdlp_solver_settings_t<int, double>{};
+
+  auto solution = cuopt::mathematical_optimization::solve_lp(&handle, mps_data, settings);
+
+  EXPECT_EQ((int)solution.get_termination_status(), CUOPT_TERMINATION_STATUS_OPTIMAL);
+
+  auto h_x = cuopt::host_copy(solution.get_primal_solution(), handle.get_stream());
+  auto h_y = cuopt::host_copy(solution.get_dual_solution(), handle.get_stream());
+  auto h_z = cuopt::host_copy(solution.get_reduced_cost(), handle.get_stream());
+
+  printf("x %e y %e z %e\n", h_x[0], h_y[0], h_z[0]);
+
+  const double tol = 1e-5;
+  EXPECT_NEAR(h_x[0], 1.0, tol);
+  EXPECT_NEAR(h_y[0], 2.0, tol);
+  EXPECT_NEAR(h_z[0], 0.0, tol);
+}
+
+TEST(barrier, qplib_8515_column_imbalance)
+{
+  // Regression test for the Ruiz equilibration skip heuristic in scaling().
+  // QPLIB_8515 has balanced rows (max-entry ratio 2) but severely imbalanced
+  // columns: its free variables appear in the constraint matrix only with
+  // ~1e-8 coefficients against O(1) rows.
+  //
+  // Reference objective 319.9999 from https://qplib.zib.de/QPLIB_8515.html.
+  const raft::handle_t handle{};
+  init_handler(&handle);
+
+  auto path =
+    cuopt::test::get_rapids_dataset_root_dir() + "/quadratic_programming/qplib/QPLIB_8515.lp";
+  auto mps_data = io::read_lp<int, double>(path);
+
+  auto settings   = pdlp_solver_settings_t<int, double>{};
+  settings.method = method_t::Barrier;
+
+  auto solution = solve_lp(&handle, mps_data, settings);
+
+  EXPECT_EQ(solution.get_termination_status(), pdlp_termination_status_t::Optimal);
+  EXPECT_NEAR(solution.get_objective_value(), 319.9999, 1e-2);
+
+  // With equilibration (the default), the well-conditioned barrier converges
+  // quickly (~14 iterations); un-equilibrated it needs far more.
+  const int iters = solution.get_additional_termination_information().number_of_steps_taken;
+  EXPECT_LT(iters, 30);
+}
+
+TEST(barrier, qplib_8515_ruiz_forced_off)
+{
+  // Forcing Ruiz equilibration off (=0) leaves QPLIB_8515's severe column
+  // imbalance in place, so the barrier needs far more iterations than the ~14
+  // it takes when equilibrated. The blow-up proves scaling() consumes
+  // qcqp_hyper_ruiz_equilibration.
+  const raft::handle_t handle{};
+  init_handler(&handle);
+
+  auto path =
+    cuopt::test::get_rapids_dataset_root_dir() + "/quadratic_programming/qplib/QPLIB_8515.lp";
+  auto mps_data = io::read_lp<int, double>(path);
+
+  auto settings                    = pdlp_solver_settings_t<int, double>{};
+  settings.method                  = method_t::Barrier;
+  settings.qcqp_ruiz_equilibration = 0;   // force off
+  settings.iteration_limit         = 50;  // equilibrated needs ~14; forced-off can't finish in 50
+
+  auto solution = solve_lp(&handle, mps_data, settings);
+
+  EXPECT_EQ(solution.get_termination_status(), pdlp_termination_status_t::IterationLimit);
+}
+
+// minimize    x2
+// subject to  x0 +   x1 + x2 >= 1
+//             x0 + 2*x1      <= 2
+//             x0, x1, x2 >= 0
+// The optimal set {x2 = 0, x0 + x1 >= 1, x0 + 2*x1 <= 2} is two-dimensional, so barrier stops near
+// its analytic center while crossover must return a vertex: at most m = 2 of the five structural
+// and slack variables may be strictly positive. Crossover used to finish without its vertex being
+// returned to the caller.
+static void barrier_crossover_returns_vertex(int dualize)
+{
+  cuopt::init_logger_t log("", true);
+  raft::handle_t handle{};
+  init_handler(&handle);
+  simplex::user_problem_t<int, double> user_problem(&handle);
+  constexpr int m  = 2;
+  constexpr int n  = 3;
+  constexpr int nz = 5;
+
+  user_problem.num_rows  = m;
+  user_problem.num_cols  = n;
+  user_problem.objective = {0.0, 0.0, 1.0};
+  user_problem.A.m       = m;
+  user_problem.A.n       = n;
+  user_problem.A.nz_max  = nz;
+  user_problem.A.reallocate(nz);
+  user_problem.A.col_start    = {0, 2, 4, 5};
+  user_problem.A.i            = {0, 1, 0, 1, 0};
+  user_problem.A.x            = {1.0, 1.0, 1.0, 2.0, 1.0};
+  user_problem.rhs            = {1.0, 2.0};
+  user_problem.row_sense      = {'G', 'L'};
+  user_problem.lower          = {0.0, 0.0, 0.0};
+  user_problem.upper          = {inf, inf, inf};
+  user_problem.num_range_rows = 0;
+  user_problem.problem_name   = "barrier crossover vertex";
+  user_problem.row_names      = {"cover", "capacity"};
+  user_problem.col_names      = {"x0", "x1", "x2"};
+  user_problem.obj_constant   = 0.0;
+  user_problem.var_types.assign(n, simplex::variable_type_t::CONTINUOUS);
+
+  simplex::simplex_solver_settings_t<int, double> settings;
+  settings.barrier   = true;  // as set by run_barrier; dualization only applies to barrier solves
+  settings.crossover = true;
+  settings.dualize   = dualize;
+  simplex::lp_solution_t<int, double> solution(m, n);
+  ASSERT_EQ((simplex::solve_linear_program_with_barrier(user_problem, settings, solution)),
+            simplex::lp_status_t::OPTIMAL);
+  ASSERT_EQ(solution.x.size(), static_cast<size_t>(n));
+
+  const double* x = solution.x.data();
+  EXPECT_NEAR(solution.user_objective, 0.0, 1e-8);
+  EXPECT_NEAR(x[2], 0.0, 1e-8);
+  const double cover_slack    = x[0] + x[1] + x[2] - 1.0;
+  const double capacity_slack = 2.0 - x[0] - 2.0 * x[1];
+  for (double v : {x[0], x[1], x[2], cover_slack, capacity_slack}) {
+    EXPECT_GE(v, -1e-8);
+  }
+  constexpr double positive   = 1e-7;
+  const int strictly_positive = (x[0] > positive) + (x[1] > positive) + (x[2] > positive) +
+                                (cover_slack > positive) + (capacity_slack > positive);
+  EXPECT_LE(strictly_positive, m) << "x = (" << x[0] << ", " << x[1] << ", " << x[2]
+                                  << ") is not a vertex";
+  // The residuals describe the returned vertex (crossover leaves them NaN)
+  EXPECT_LE(solution.l2_primal_residual, 1e-8);
+  EXPECT_LE(solution.l2_dual_residual, 1e-8);
+}
+
+TEST(barrier, crossover_returns_vertex) { barrier_crossover_returns_vertex(0); }
+
+TEST(barrier, crossover_returns_vertex_when_solving_dual) { barrier_crossover_returns_vertex(1); }
+
+TEST(barrier, cudss_deterministic_with_hybrid_execute_rejected)
+{
+  const raft::handle_t handle{};
+  init_handler(&handle);
+
+  auto path = cuopt::test::get_rapids_dataset_root_dir() + "/linear_programming/afiro_original.mps";
+  auto mps_data = io::read_mps<int, double>(path);
+
+  auto settings                      = pdlp_solver_settings_t<int, double>{};
+  settings.method                    = method_t::Barrier;
+  settings.cudss_deterministic       = true;
+  settings.cudss_hybrid_execute_mode = 1;
+
+  auto solution = solve_lp(&handle, mps_data, settings);
+  EXPECT_EQ(solution.get_error_status().get_error_type(), cuopt::error_type_t::ValidationError);
+}
+
+}  // namespace cuopt::mathematical_optimization::simplex::test

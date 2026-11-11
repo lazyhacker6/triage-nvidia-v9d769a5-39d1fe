@@ -1,0 +1,94 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+. /opt/conda/etc/profile.d/conda.sh
+
+rapids-logger "Configuring conda strict channel priority"
+conda config --set channel_priority strict
+
+CPP_CHANNEL=$(rapids-download-from-github "$(rapids-artifact-name conda_cpp libcuopt cuopt --cuda "$RAPIDS_CUDA_VERSION")")
+
+rapids-logger "Generate C++ testing dependencies"
+rapids-dependency-file-generator \
+  --output conda \
+  --file-key test_cpp \
+  --prepend-channel "${CPP_CHANNEL}" \
+  --matrix "cuda=${RAPIDS_CUDA_VERSION%.*};arch=$(arch)" | tee env.yaml
+
+rapids-mamba-retry env create --yes -f env.yaml -n test --channel "${CPP_CHANNEL}"
+
+# Temporarily allow unbound variables for conda activation.
+set +u
+conda activate test
+set -u
+
+RAPIDS_TESTS_DIR=${RAPIDS_TESTS_DIR:-"${PWD}/test-results"}/
+mkdir -p "${RAPIDS_TESTS_DIR}"
+
+rapids-print-env
+
+rapids-logger "Check GPU usage"
+nvidia-smi
+
+# CUOPT_CPP_TEST_GROUP: all (default), routing or mathopt; see run_ctests.sh
+CUOPT_CPP_TEST_GROUP="${CUOPT_CPP_TEST_GROUP:-all}"
+export CUOPT_CPP_TEST_GROUP
+
+# LP/MIP/QP datasets are for mathopt tests; get_test_data.sh fetches the routing datasets.
+if [[ "${CUOPT_CPP_TEST_GROUP}" != "routing" ]]; then
+    rapids-logger "Download mathopt datasets"
+    ./datasets/linear_programming/download_pdlp_test_dataset.sh
+    ./datasets/mip/download_miplib_test_dataset.sh
+    ./datasets/quadratic_programming/download_qplib_test_dataset.sh
+fi
+
+RAPIDS_DATASET_ROOT_DIR="$(realpath datasets)"
+export RAPIDS_DATASET_ROOT_DIR
+
+if [[ "${CUOPT_CPP_TEST_GROUP}" != "mathopt" ]]; then
+    rapids-logger "Download routing datasets"
+    pushd "${RAPIDS_DATASET_ROOT_DIR}"
+    ./get_test_data.sh
+    popd
+fi
+
+EXITCODE=0
+FAILED_STEPS=()
+trap "EXITCODE=1" ERR
+set +e
+
+# shellcheck source=ci/utils/crash_helpers.sh
+source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/utils/crash_helpers.sh"
+
+
+# Run gtests from libcuopt-tests package
+# XML output and retry logic handled by run_ctests.sh
+export RAPIDS_TESTS_DIR
+
+rapids-logger "Run gtests"
+# Temporarily skip gRPC server tests that cancel active or queued jobs.
+GRPC_JOB_CANCEL_FILTER="-DefaultServerTests.CancelNonexistentJob:DefaultServerTests.IncumbentCallbackCancelsSolve:DefaultServerTests.CancelRunningJob:DefaultServerTests.DeleteQueuedJobPreventsRun:DefaultServerTests.DeleteRunningJobCancelsWorker:ErrorRecoveryTests.SigintDuringRunningJobShutsDownPromptly"
+run_step_with_timeout "gtests (run_ctests.sh)" 90m "" \
+  ./ci/run_ctests.sh --gtest_filter="${GRPC_JOB_CANCEL_FILTER}"
+
+rapids-logger "Generate nightly test report"
+source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/utils/nightly_report_helper.sh"
+# Separate report type per group so routing/mathopt keep separate history.
+REPORT_TYPE="cpp"
+[[ "${CUOPT_CPP_TEST_GROUP}" != "all" ]] && REPORT_TYPE="cpp-${CUOPT_CPP_TEST_GROUP}"
+generate_nightly_report "${REPORT_TYPE}"
+
+if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+    EXITCODE=1
+    echo ""
+    echo "==================== FAILED TEST STEPS (${#FAILED_STEPS[@]}) ===================="
+    for s in "${FAILED_STEPS[@]}"; do echo "  - ${s}"; done
+    echo "================================================================"
+fi
+
+rapids-logger "Test script exiting with value: $EXITCODE"
+exit ${EXITCODE}

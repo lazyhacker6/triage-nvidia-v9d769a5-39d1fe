@@ -1,0 +1,271 @@
+/* clang-format off */
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/* clang-format on */
+
+#pragma once
+
+#include <cuopt/export.hpp>
+#include <cuopt/mathematical_optimization/optimization_problem_interface.hpp>
+
+#include <raft/core/handle.hpp>
+#include <rmm/device_uvector.hpp>
+
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <vector>
+
+namespace cuopt {
+namespace CUOPT_EXPORT mathematical_optimization {
+
+namespace io {
+template <typename i_t, typename f_t>
+class mps_data_model_t;
+}
+
+// Forward declarations
+template <typename i_t, typename f_t>
+class optimization_problem_t;
+
+template <typename i_t, typename f_t>
+class pdlp_solver_settings_t;
+template <typename i_t, typename f_t>
+class mip_solver_settings_t;
+template <typename i_t, typename f_t>
+class lp_solution_interface_t;
+template <typename i_t, typename f_t>
+class mip_solution_interface_t;
+
+/**
+ * @brief CPU-based implementation of optimization_problem_interface_t.
+ *
+ * This implementation stores all data in CPU memory using std::vector.
+ * It only implements host getters (returning std::vector by value).
+ * Device getters throw exceptions as GPU memory access is not supported.
+ */
+template <typename i_t, typename f_t>
+class cpu_optimization_problem_t : public optimization_problem_interface_t<i_t, f_t> {
+ public:
+  using typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t;
+
+  cpu_optimization_problem_t();
+
+  // Setters
+  void set_maximize(bool maximize) override;
+  void set_csr_constraint_matrix(const f_t* A_values,
+                                 i_t size_values,
+                                 const i_t* A_indices,
+                                 i_t size_indices,
+                                 const i_t* A_offsets,
+                                 i_t size_offsets) override;
+  void set_constraint_bounds(const f_t* b, i_t size) override;
+  void set_objective_coefficients(const f_t* c, i_t size) override;
+  void set_objective_scaling_factor(f_t objective_scaling_factor) override;
+  void set_objective_offset(f_t objective_offset) override;
+  void set_quadratic_objective_matrix(const f_t* Q_values,
+                                      i_t size_values,
+                                      const i_t* Q_indices,
+                                      i_t size_indices,
+                                      const i_t* Q_offsets,
+                                      i_t size_offsets,
+                                      bool validate_positive_semi_definite = false) override;
+  void set_variable_lower_bounds(const f_t* variable_lower_bounds, i_t size) override;
+  void set_variable_upper_bounds(const f_t* variable_upper_bounds, i_t size) override;
+  void set_variable_types(const var_t* variable_types, i_t size) override;
+  void set_problem_category(const problem_category_t& category) override;
+  void set_constraint_lower_bounds(const f_t* constraint_lower_bounds, i_t size) override;
+  void set_constraint_upper_bounds(const f_t* constraint_upper_bounds, i_t size) override;
+  void set_row_types(const char* row_types, i_t size) override;
+  void set_objective_name(const std::string& objective_name) override;
+  void set_problem_name(const std::string& problem_name) override;
+  void set_variable_names(const std::vector<std::string>& variable_names) override;
+  void set_row_names(const std::vector<std::string>& row_names) override;
+  /**
+   * @brief Copy an initial primal solution into host storage.
+   *
+   * Optional. Size and finiteness are not checked here; the solver validates
+   * those when the start is applied, matching local solve.
+   *
+   * @param[in] initial_primal_solution Host values; copied. Empty clears the start.
+   */
+  void set_initial_primal_solution(std::span<const f_t> initial_primal_solution);
+  /**
+   * @brief Copy an initial dual solution into host storage.
+   *
+   * Optional. Size and finiteness are not checked here; the solver validates
+   * those when the start is applied, matching local solve.
+   *
+   * @param[in] initial_dual_solution Host values; copied. Empty clears the start.
+   */
+  void set_initial_dual_solution(std::span<const f_t> initial_dual_solution);
+
+  /**
+   * @brief Transfer parsed MPS/QPS storage into this CPU problem without copying array/string data.
+   *
+   * The model is left in a moved-from state and must not be used afterward.
+   */
+  void adopt_from_mps_data_model(io::mps_data_model_t<i_t, f_t>&& data_model);
+
+  // Device getters - throw exceptions (not supported for CPU implementation)
+  i_t get_n_variables() const override;
+  i_t get_n_constraints() const override;
+  i_t get_nnz() const override;
+  i_t get_n_integers() const override;
+  const rmm::device_uvector<f_t>& get_constraint_matrix_values() const override;
+  rmm::device_uvector<f_t>& get_constraint_matrix_values() override;
+  const rmm::device_uvector<i_t>& get_constraint_matrix_indices() const override;
+  rmm::device_uvector<i_t>& get_constraint_matrix_indices() override;
+  const rmm::device_uvector<i_t>& get_constraint_matrix_offsets() const override;
+  rmm::device_uvector<i_t>& get_constraint_matrix_offsets() override;
+  const rmm::device_uvector<f_t>& get_constraint_bounds() const override;
+  rmm::device_uvector<f_t>& get_constraint_bounds() override;
+  const rmm::device_uvector<f_t>& get_objective_coefficients() const override;
+  rmm::device_uvector<f_t>& get_objective_coefficients() override;
+  f_t get_objective_scaling_factor() const override;
+  f_t get_objective_offset() const override;
+  const rmm::device_uvector<f_t>& get_variable_lower_bounds() const override;
+  rmm::device_uvector<f_t>& get_variable_lower_bounds() override;
+  const rmm::device_uvector<f_t>& get_variable_upper_bounds() const override;
+  rmm::device_uvector<f_t>& get_variable_upper_bounds() override;
+  const rmm::device_uvector<f_t>& get_constraint_lower_bounds() const override;
+  rmm::device_uvector<f_t>& get_constraint_lower_bounds() override;
+  const rmm::device_uvector<f_t>& get_constraint_upper_bounds() const override;
+  rmm::device_uvector<f_t>& get_constraint_upper_bounds() override;
+  const rmm::device_uvector<char>& get_row_types() const override;
+  const rmm::device_uvector<var_t>& get_variable_types() const override;
+  bool get_sense() const override;
+  bool empty() const override;
+  std::string get_objective_name() const override;
+  std::string get_problem_name() const override;
+  problem_category_t get_problem_category() const override;
+  bool has_semi_continuous_variables() const noexcept;
+  const std::vector<std::string>& get_variable_names() const override;
+  const std::vector<std::string>& get_row_names() const override;
+  const std::vector<i_t>& get_quadratic_objective_offsets() const override;
+  const std::vector<i_t>& get_quadratic_objective_indices() const override;
+  const std::vector<f_t>& get_quadratic_objective_values() const override;
+  const std::vector<i_t>& get_quadratic_objective_offsets_host() const
+  {
+    return get_quadratic_objective_offsets();
+  }
+  const std::vector<i_t>& get_quadratic_objective_indices_host() const
+  {
+    return get_quadratic_objective_indices();
+  }
+  const std::vector<f_t>& get_quadratic_objective_values_host() const
+  {
+    return get_quadratic_objective_values();
+  }
+  bool has_quadratic_objective() const override;
+
+  void set_quadratic_constraints(std::vector<quadratic_constraint_t> constraints) override;
+  void add_quadratic_constraint(char constraint_row_type,
+                                f_t rhs_value,
+                                std::span<const i_t> row_index,
+                                std::span<const i_t> col_index,
+                                std::span<const f_t> coeff,
+                                std::span<const f_t> linear_values,
+                                std::span<const i_t> linear_indices) override;
+  bool has_quadratic_constraints() const override;
+  const std::vector<quadratic_constraint_t>& get_quadratic_constraints() const override;
+
+  // Host getters - these are the only supported getters for CPU implementation
+  std::vector<f_t> get_constraint_matrix_values_host() const override;
+  std::vector<i_t> get_constraint_matrix_indices_host() const override;
+  std::vector<i_t> get_constraint_matrix_offsets_host() const override;
+  std::vector<f_t> get_constraint_bounds_host() const override;
+  std::vector<f_t> get_objective_coefficients_host() const override;
+  std::vector<f_t> get_variable_lower_bounds_host() const override;
+  std::vector<f_t> get_variable_upper_bounds_host() const override;
+  std::vector<f_t> get_constraint_lower_bounds_host() const override;
+  std::vector<f_t> get_constraint_upper_bounds_host() const override;
+  std::vector<char> get_row_types_host() const override;
+  std::vector<var_t> get_variable_types_host() const override;
+  /**
+   * @brief Return a copy of the stored initial primal solution (empty if unset).
+   */
+  std::vector<f_t> get_initial_primal_solution_host() const;
+  /**
+   * @brief Return a copy of the stored initial dual solution (empty if unset).
+   */
+  std::vector<f_t> get_initial_dual_solution_host() const;
+
+  /**
+   * @brief Write the optimization problem to a file.
+   * @param[in] file_path Path to the output file
+   * @param[in] format    File format to write (MPS or LP)
+   */
+  void write_to_file(const std::string& file_path, file_format_t format) override;
+
+  /**
+   * @brief Check if this problem is equivalent to another problem.
+   * @param[in] other The other optimization problem to compare against
+   * @return true if the problems are equivalent (up to permutation of variables/constraints)
+   */
+  bool is_equivalent(const optimization_problem_interface_t<i_t, f_t>& other) const override;
+
+  // C API support: Copy to host (polymorphic)
+  void copy_objective_coefficients_to_host(f_t* output, i_t size) const override;
+  void copy_constraint_matrix_to_host(f_t* values,
+                                      i_t* indices,
+                                      i_t* offsets,
+                                      i_t num_values,
+                                      i_t num_indices,
+                                      i_t num_offsets) const override;
+  void copy_row_types_to_host(char* output, i_t size) const override;
+  void copy_constraint_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_constraint_lower_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_constraint_upper_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_variable_lower_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_variable_upper_bounds_to_host(f_t* output, i_t size) const override;
+  void copy_variable_types_to_host(var_t* output, i_t size) const override;
+
+ private:
+  // Reads this class's host-side storage directly. Callers include optimization_problem.hpp,
+  // where it is declared; this friend declaration alone is not visible to ordinary lookup.
+  template <typename I, typename F>
+  friend std::unique_ptr<optimization_problem_t<I, F>> to_optimization_problem(
+    optimization_problem_interface_t<I, F>&, raft::handle_t const*);
+
+  problem_category_t problem_category_ = problem_category_t::LP;
+  bool has_semi_continuous_variables_{false};
+  bool maximize_{false};
+  i_t n_vars_{0};
+  i_t n_constraints_{0};
+
+  // CPU memory storage
+  std::vector<f_t> A_;
+  std::vector<i_t> A_indices_;
+  std::vector<i_t> A_offsets_;
+  std::vector<f_t> b_;
+  std::vector<f_t> c_;
+  f_t objective_scaling_factor_{1};
+  f_t objective_offset_{0};
+
+  std::vector<i_t> Q_offsets_;
+  std::vector<i_t> Q_indices_;
+  std::vector<f_t> Q_values_;
+
+  std::vector<quadratic_constraint_t> quadratic_constraints_{};
+
+  std::vector<f_t> variable_lower_bounds_;
+  std::vector<f_t> variable_upper_bounds_;
+  std::vector<f_t> constraint_lower_bounds_;
+  std::vector<f_t> constraint_upper_bounds_;
+  std::vector<char> row_types_;
+  std::vector<var_t> variable_types_;
+  std::vector<f_t> initial_primal_solution_;
+  std::vector<f_t> initial_dual_solution_;
+
+  std::string objective_name_;
+  std::string problem_name_;
+  std::vector<std::string> var_names_{};
+  std::vector<std::string> row_names_{};
+};
+
+}  // namespace CUOPT_EXPORT mathematical_optimization
+}  // namespace cuopt
